@@ -1,0 +1,440 @@
+// MCL CRM data model — section 8 of the Backend Requirements Report.
+// Not yet modelled (blocked): couriers / rate_charts / rate_chart_entries / rate_calculations (needs approved rates, Q21).
+
+generator client {
+  provider        = "prisma-client"
+  output          = "../src/generated/prisma"
+  // Load nested relations in one SQL query (LATERAL joins) instead of one query per level:
+  // every request's session → user → role → permissions lookup was 4 sequential round trips to Neon.
+  previewFeatures = ["relationJoins"]
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum UserStatus {
+  active
+  inactive
+}
+
+enum Priority {
+  low
+  medium
+  high
+}
+
+enum PaymentStatus {
+  pending
+  completed
+}
+
+enum CustomerType {
+  direct
+  b2b
+}
+
+enum ShipmentType {
+  air
+  water
+}
+
+enum FollowUpType {
+  whatsapp
+  call
+  email
+  meeting
+}
+
+// Overdue is derived at read time (dueDate before today in Asia/Kolkata), never stored.
+enum FollowUpStatus {
+  pending
+  completed
+}
+
+enum CustomerStatus {
+  active
+  inactive
+}
+
+// What happened in a customer activity entry (Sprint 3: Initial / Follow Up / Call).
+enum CustomerActivityType {
+  initial
+  follow_up
+  call
+}
+
+model User {
+  id           String     @id @default(uuid()) @db.Uuid
+  name         String
+  email        String     @unique // stored lower-cased by the API
+  phone        String?
+  passwordHash String     @map("password_hash")
+  roleId       String     @map("role_id") @db.Uuid
+  status       UserStatus @default(active)
+  lastLoginAt  DateTime?  @map("last_login_at") @db.Timestamptz(3)
+  createdAt    DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  role              Role                 @relation(fields: [roleId], references: [id], onDelete: Restrict)
+  sessions          Session[]
+  passwordResets    PasswordReset[]
+  ownedLeads        Lead[]               @relation("LeadOwner")
+  createdLeads      Lead[]               @relation("LeadCreator")
+  activities        LeadActivity[]
+  assignedFollowUps FollowUp[]           @relation("FollowUpAssignee")
+  createdFollowUps  FollowUp[]           @relation("FollowUpCreator")
+  reminders         Reminder[]
+  attachments       LeadAttachment[]
+  customers         Customer[]
+  customerFiles     CustomerAttachment[]
+  customerActivity  CustomerActivity[]
+  notifications     Notification[]
+  auditLogs         AuditLog[]
+
+  @@index([roleId])
+  @@index([status])
+  @@map("users")
+}
+
+model Role {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String   @unique
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  users       User[]
+  permissions RolePermission[]
+
+  @@map("roles")
+}
+
+// Fixed catalogue, seeded: dashboard, leads, customers, follow_ups, users,
+// notifications, calculator, settings, all_records.
+model Permission {
+  code  String @id
+  label String
+
+  roles RolePermission[]
+
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId         String @map("role_id") @db.Uuid
+  permissionCode String @map("permission_code")
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionCode], references: [code], onDelete: Restrict)
+
+  @@id([roleId, permissionCode])
+  @@map("role_permissions")
+}
+
+model Session {
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String   @map("user_id") @db.Uuid
+  tokenHash  String   @unique @map("token_hash")
+  expiresAt  DateTime @map("expires_at") @db.Timestamptz(3)
+  lastSeenAt DateTime @default(now()) @map("last_seen_at") @db.Timestamptz(3)
+  ip         String?
+  userAgent  String?  @map("user_agent")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+// Forgot-password flow: OTP emailed → verified → short-lived reset token → new password.
+model PasswordReset {
+  id             String    @id @default(uuid()) @db.Uuid
+  userId         String    @map("user_id") @db.Uuid
+  otpHash        String    @map("otp_hash")
+  otpExpiresAt   DateTime  @map("otp_expires_at") @db.Timestamptz(3)
+  attempts       Int       @default(0)
+  verifiedAt     DateTime? @map("verified_at") @db.Timestamptz(3)
+  resetTokenHash String?   @unique @map("reset_token_hash")
+  resetExpiresAt DateTime? @map("reset_expires_at") @db.Timestamptz(3)
+  usedAt         DateTime? @map("used_at") @db.Timestamptz(3)
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@map("password_resets")
+}
+
+model LeadSource {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String   @unique
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  leads     Lead[]
+  customers Customer[]
+
+  @@map("lead_sources")
+}
+
+model LeadStatus {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String   @unique
+  sortOrder Int      @unique @map("sort_order")
+  isWon     Boolean  @default(false) @map("is_won")
+  isLost    Boolean  @default(false) @map("is_lost")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  leads Lead[]
+
+  @@map("lead_statuses")
+}
+
+model Lead {
+  id                         String        @id @default(uuid()) @db.Uuid
+  title                      String
+  description                String?
+  address                    String?
+  district                   String?
+  contactName                String?       @map("contact_name")
+  contactPhone               String?       @map("contact_phone")
+  contactEmail               String?       @map("contact_email")
+  customerType               CustomerType? @map("customer_type")
+  companyName                String?       @map("company_name")
+  companyLocation            String?       @map("company_location")
+  companyEmail               String?       @map("company_email")
+  sourceId                   String?       @map("source_id") @db.Uuid
+  statusId                   String        @map("status_id") @db.Uuid
+  priority                   Priority      @default(low)
+  expectedValue              Decimal?      @map("expected_value") @db.Decimal(14, 2)
+  paymentStatus              PaymentStatus @default(pending) @map("payment_status")
+  ownerId                    String?       @map("owner_id") @db.Uuid
+  createdById                String        @map("created_by") @db.Uuid
+  shipmentDestinationCountry String?       @map("shipment_destination_country")
+  shipmentCommodity          String?       @map("shipment_commodity")
+  shipmentType               ShipmentType? @map("shipment_type")
+  shipmentWeightKg           Decimal?      @map("shipment_weight_kg") @db.Decimal(10, 3)
+  shipmentVolume             String?       @map("shipment_volume")
+  shipmentPickupLocation     String?       @map("shipment_pickup_location")
+  shipmentDeliveryLocation   String?       @map("shipment_delivery_location")
+  version                    Int           @default(1)
+  deletedAt                  DateTime?     @map("deleted_at") @db.Timestamptz(3)
+  createdAt                  DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt                  DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+  // The customer this lead was converted into (POST /leads/:id/convert). Several leads can belong to one customer
+  // (repeat business); the link is set once and kept, whatever happens to the lead's stage afterwards.
+  customerId                 String?       @map("customer_id") @db.Uuid
+  convertedAt                DateTime?     @map("converted_at") @db.Timestamptz(3)
+
+  source          LeadSource?      @relation(fields: [sourceId], references: [id], onDelete: Restrict)
+  status          LeadStatus       @relation(fields: [statusId], references: [id], onDelete: Restrict)
+  owner           User?            @relation("LeadOwner", fields: [ownerId], references: [id], onDelete: Restrict)
+  createdBy       User             @relation("LeadCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  activities      LeadActivity[]
+  followUps       FollowUp[]
+  reminders       Reminder[]
+  customer        Customer?        @relation("LeadConversions", fields: [customerId], references: [id], onDelete: Restrict)
+  createdCustomer Customer?        @relation("CustomerSourceLead") // the customer first created from this lead, if any
+  attachments     LeadAttachment[]
+
+  // ponytail: plain ILIKE search; add pg_trgm GIN indexes on title/contact/company if leads pass ~50k rows
+  @@index([statusId])
+  @@index([ownerId])
+  @@index([sourceId])
+  @@index([createdAt(sort: Desc)])
+  @@index([customerId])
+  @@map("leads")
+}
+
+// Files attached to a lead. The bytes live in Cloudinary as *private* assets (no public URL); this row is the
+// metadata and the only way to them: downloads go through the API, which checks the caller can see the lead and
+// hands out a short-lived signed link. Leads are only soft-deleted, so their files are kept with them.
+model LeadAttachment {
+  id                String   @id @default(uuid()) @db.Uuid
+  leadId            String   @map("lead_id") @db.Uuid
+  publicId          String   @unique @map("public_id") // Cloudinary public_id, generated by the API
+  resourceType      String   @map("resource_type") // Cloudinary "image" (photos) or "raw" (documents, stored byte-for-byte)
+  fileName          String   @map("file_name") // as the user named it; display only
+  mimeType          String   @map("mime_type") // detected from the file's content, not its name
+  sizeBytes         Int      @map("size_bytes") // as stored
+  originalSizeBytes Int?     @map("original_size_bytes") // before in-browser compression; null when not compressed
+  uploadedById      String   @map("uploaded_by") @db.Uuid
+  createdAt         DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  lead       Lead @relation(fields: [leadId], references: [id], onDelete: Restrict)
+  uploadedBy User @relation(fields: [uploadedById], references: [id], onDelete: Restrict)
+
+  @@index([leadId, createdAt])
+  @@map("lead_attachments")
+}
+
+// Append-only timeline; the API never updates or deletes these rows.
+model LeadActivity {
+  id        String   @id @default(uuid()) @db.Uuid
+  leadId    String   @map("lead_id") @db.Uuid
+  actorId   String?  @map("actor_id") @db.Uuid
+  type      String
+  message   String
+  data      Json?
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  lead  Lead  @relation(fields: [leadId], references: [id], onDelete: Restrict)
+  actor User? @relation(fields: [actorId], references: [id], onDelete: Restrict)
+
+  @@index([leadId, createdAt(sort: Desc)])
+  @@map("lead_activities")
+}
+
+model FollowUp {
+  id               String         @id @default(uuid()) @db.Uuid
+  leadId           String         @map("lead_id") @db.Uuid
+  note             String
+  type             FollowUpType
+  assignedUserId   String?        @map("assigned_user_id") @db.Uuid
+  dueDate          DateTime       @map("due_date") @db.Date
+  nextFollowUpDate DateTime?      @map("next_follow_up_date") @db.Date
+  status           FollowUpStatus @default(pending)
+  completedAt      DateTime?      @map("completed_at") @db.Timestamptz(3)
+  createdById      String         @map("created_by") @db.Uuid
+  createdAt        DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  lead      Lead  @relation(fields: [leadId], references: [id], onDelete: Restrict)
+  assignee  User? @relation("FollowUpAssignee", fields: [assignedUserId], references: [id], onDelete: Restrict)
+  createdBy User  @relation("FollowUpCreator", fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@index([status, dueDate])
+  @@index([assignedUserId])
+  @@index([leadId])
+  @@map("follow_ups")
+}
+
+// Stored only. Delivery (who is reminded, how) awaits Q18/Q19.
+model Reminder {
+  id          String    @id @default(uuid()) @db.Uuid
+  leadId      String    @map("lead_id") @db.Uuid
+  title       String
+  dueAt       DateTime  @map("due_at") @db.Timestamptz(3)
+  notes       String?
+  createdById String    @map("created_by") @db.Uuid
+  notifiedAt  DateTime? @map("notified_at") @db.Timestamptz(3)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  lead      Lead @relation(fields: [leadId], references: [id], onDelete: Restrict)
+  createdBy User @relation(fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@index([dueAt])
+  @@map("reminders")
+}
+
+// No create/edit endpoint until Q1/Q3 (conversion, manual creation) are answered.
+model Customer {
+  id              String         @id @default(uuid()) @db.Uuid
+  // CU-00001…: from a PostgreSQL sequence (next_customer_code(), see migration 20261017000000), never reused;
+  // a rolled-back conversion leaves a gap rather than a duplicate.
+  code            String         @unique @default(dbgenerated("next_customer_code()"))
+  name            String
+  company         String?
+  phone           String?
+  email           String?
+  address         String?
+  district        String?
+  companyLocation String?        @map("company_location")
+  companyEmail    String?        @map("company_email")
+  type            String?
+  sourceId        String?        @map("source_id") @db.Uuid
+  assignedUserId  String?        @map("assigned_user_id") @db.Uuid
+  status          CustomerStatus @default(active)
+  note            String?
+  leadId          String?        @unique @map("lead_id") @db.Uuid // source lead: the lead this customer was created from
+  deletedAt       DateTime?      @map("deleted_at") @db.Timestamptz(3)
+  createdAt       DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  source      LeadSource?          @relation(fields: [sourceId], references: [id], onDelete: Restrict)
+  assignee    User?                @relation(fields: [assignedUserId], references: [id], onDelete: Restrict)
+  lead        Lead?                @relation("CustomerSourceLead", fields: [leadId], references: [id], onDelete: Restrict)
+  leads       Lead[]               @relation("LeadConversions") // every lead converted into this customer
+  attachments CustomerAttachment[]
+  activities  CustomerActivity[]
+
+  @@index([status])
+  @@index([assignedUserId])
+  @@map("customers")
+}
+
+// Files added to a customer. A separate table from lead_attachments: the owner (and so who may see or remove a
+// file) differs. The original lead's files stay with the lead and are reached through it, never copied.
+model CustomerAttachment {
+  id                String   @id @db.Uuid // chosen by the uploader, so a retried upload finds the file already saved
+  customerId        String   @map("customer_id") @db.Uuid
+  publicId          String   @unique @map("public_id")
+  resourceType      String   @map("resource_type")
+  fileName          String   @map("file_name")
+  mimeType          String   @map("mime_type")
+  sizeBytes         Int      @map("size_bytes")
+  originalSizeBytes Int?     @map("original_size_bytes")
+  uploadedById      String   @map("uploaded_by_id") @db.Uuid
+  createdAt         DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  uploadedBy User     @relation(fields: [uploadedById], references: [id], onDelete: Restrict)
+
+  @@index([customerId, createdAt])
+  @@map("customer_attachments")
+}
+
+model CustomerActivity {
+  id         String               @id @db.Uuid // chosen by the form, so a retried save is not recorded twice
+  customerId String               @map("customer_id") @db.Uuid
+  type       CustomerActivityType
+  occurredAt DateTime             @map("occurred_at") @db.Timestamptz(3)
+  notes      String?
+  actorId    String               @map("actor_id") @db.Uuid
+  createdAt  DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  actor    User     @relation(fields: [actorId], references: [id], onDelete: Restrict)
+
+  @@index([customerId, occurredAt(sort: Desc)])
+  @@map("customer_activities")
+}
+
+// Feed only. Which events create notifications awaits Q19.
+model Notification {
+  id         String    @id @default(uuid()) @db.Uuid
+  userId     String    @map("user_id") @db.Uuid
+  title      String
+  detail     String?
+  link       String?
+  sourceType String?   @map("source_type")
+  sourceId   String?   @map("source_id")
+  readAt     DateTime? @map("read_at") @db.Timestamptz(3)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("notifications")
+}
+
+// Append-only security trail. Never stores password hashes, OTPs or tokens.
+model AuditLog {
+  id         BigInt   @id @default(autoincrement())
+  actorId    String?  @map("actor_id") @db.Uuid
+  action     String
+  entityType String   @map("entity_type")
+  entityId   String?  @map("entity_id")
+  before     Json?
+  after      Json?
+  ip         String?
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  actor User? @relation(fields: [actorId], references: [id], onDelete: Restrict)
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
