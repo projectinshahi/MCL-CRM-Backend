@@ -311,7 +311,7 @@ model FollowUp {
   @@map("follow_ups")
 }
 
-// Stored only. Delivery (who is reminded, how) awaits Q18/Q19.
+// Delivered at due_at as an in-app notification to its creator and the lead's owner; notified_at marks it sent.
 model Reminder {
   id          String    @id @default(uuid()) @db.Uuid
   leadId      String    @map("lead_id") @db.Uuid
@@ -402,7 +402,8 @@ model CustomerActivity {
   @@map("customer_activities")
 }
 
-// Feed only. Which events create notifications awaits Q19.
+// In-app notifications, one row per recipient (so read and cleared are per person). Made by src/lib/notify.ts after
+// the change they report is saved, and by the due-date reminders (src/modules/notifications/reminders.ts).
 model Notification {
   id         String    @id @default(uuid()) @db.Uuid
   userId     String    @map("user_id") @db.Uuid
@@ -411,12 +412,18 @@ model Notification {
   link       String?
   sourceType String?   @map("source_type")
   sourceId   String?   @map("source_id")
+  // The event occurrence, e.g. "fu_due_today:<id>:2026-10-18": unique per user, so nothing notifies anyone twice.
+  dedupeKey  String?   @map("dedupe_key")
   readAt     DateTime? @map("read_at") @db.Timestamptz(3)
+  // Cleared by its reader. Kept (and purged after 30 days) so a reminder they cleared is not made again.
+  deletedAt  DateTime? @map("deleted_at") @db.Timestamptz(3)
   createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
+  @@unique([userId, dedupeKey])
   @@index([userId, createdAt(sort: Desc)])
+  @@index([userId, readAt]) // the bell's unread count, polled by every open tab
   @@map("notifications")
 }
 

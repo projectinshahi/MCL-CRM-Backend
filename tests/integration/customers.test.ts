@@ -149,6 +149,47 @@ describe.skipIf(!hasDb)("lead → customer: created with the lead", () => {
     expect([await prisma.lead.count(), await prisma.customer.count(), await prisma.leadActivity.count({ where: { type: "customer_created" } })]).toEqual([2, 2, 2]);
   });
 
+  it("a retried create of a lead made for a colleague returns it, without a second lead or customer", async () => {
+    const staff = await signedIn(["leads"]); // no All records: the lead is outside the creator's scope once it is the colleague's
+    const colleague = await makeUser(["leads"]);
+    const body = { id: crypto.randomUUID(), title: "For a colleague", contact: { name: "Mani" }, ownerId: colleague.user.id };
+    const first = await staff.agent.post(`${API}/leads`).send(body);
+    const again = await staff.agent.post(`${API}/leads`).send(body); // the reply was lost; the form sends it again
+    expect([first.status, again.status]).toEqual([201, 200]);
+    expect(again.body.id).toBe(body.id);
+    expect([await prisma.lead.count(), await prisma.customer.count()]).toEqual([1, 1]);
+  });
+
+  it("a reassigned lead takes its customer to the new owner, unless the customer was given to someone else", async () => {
+    const staff = await signedIn(["leads", "customers"]);
+    const rep = await signedIn(["leads", "customers"]);
+    const keeper = await makeUser(["customers"]);
+    const boss = await signedIn(["leads", "customers", "all_records"]);
+    const lead = (await staff.agent.post(`${API}/leads`).send({ title: "Walk-in", contact: { name: "Kiran" } })).body;
+    const id = lead.customer.id;
+
+    // The Assign button: the new owner can open the customer, the previous one no longer can. Audited.
+    expect((await boss.agent.post(`${API}/leads/${lead.id}/assign`).send({ ownerId: rep.user.id })).status).toBe(200);
+    expect((await customerOf(lead.id)).assignedUserId).toBe(rep.user.id);
+    expect((await rep.agent.get(`${API}/customers/${id}`)).status).toBe(200);
+    expect((await staff.agent.get(`${API}/customers/${id}`)).status).toBe(404);
+    expect(await prisma.auditLog.findFirstOrThrow({ where: { action: "customer_assigned", entityId: id } })).toMatchObject({
+      actorId: boss.user.id,
+      before: { assignedUserId: staff.user.id },
+      after: { assignedUserId: rep.user.id, withLead: lead.id },
+    });
+
+    // The edit form (PATCH ownerId) does the same.
+    expect((await boss.agent.patch(`${API}/leads/${lead.id}`).send({ ownerId: staff.user.id })).status).toBe(200);
+    expect((await customerOf(lead.id)).assignedUserId).toBe(staff.user.id);
+
+    // A customer handed to someone else on purpose stays with them when the lead moves on.
+    expect((await boss.agent.patch(`${API}/customers/${id}`).send({ assignedUserId: keeper.user.id })).status).toBe(200);
+    expect((await boss.agent.post(`${API}/leads/${lead.id}/assign`).send({ ownerId: rep.user.id })).status).toBe(200);
+    expect((await customerOf(lead.id)).assignedUserId).toBe(keeper.user.id);
+    expect(await prisma.auditLog.count({ where: { action: "customer_assigned", entityId: id } })).toBe(2);
+  });
+
   it("gives every customer a unique CU code from a sequence, also under concurrent lead creation", async () => {
     const { agent } = await signedIn(["leads", "customers"]);
     const created = await Promise.all(Array.from({ length: 8 }, (_, i) => agent.post(`${API}/leads`).send({ title: `L${i}`, contact: { name: `Person ${i}` } })));

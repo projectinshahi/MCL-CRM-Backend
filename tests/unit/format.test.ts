@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { followUpStatus, initials, leadLabel, parseDateOnly, todayIST, toMoney } from "../../src/lib/format.ts";
+import { addDays, followUpStatus, indiaDate, initials, leadLabel, parseDateOnly, todayIST, toMoney } from "../../src/lib/format.ts";
 
 describe("todayIST", () => {
   it("rolls over at midnight in India, not UTC", () => {
@@ -32,4 +32,16 @@ describe("labels", () => {
     expect(leadLabel({ title: "Lead", companyName: "MediShip", contactName: "Ribeesh" })).toBe("MediShip - Ribeesh");
     expect(leadLabel({ title: "Lead", companyName: null, contactName: null })).toBe("Lead");
   });
+});
+
+describe("addDays / indiaDate (reminder dates)", () => {
+  it("crosses month ends, year ends and leap days by the calendar", () => {
+    expect(addDays("2026-10-31", 1)).toBe("2026-11-01");
+    expect(addDays("2026-01-01", -1)).toBe("2025-12-31");
+    expect(addDays("2028-02-28", 1)).toBe("2028-02-29"); // leap year
+    expect(addDays("2027-02-28", 1)).toBe("2027-03-01");
+    expect(addDays("2028-03-01", -1)).toBe("2028-02-29");
+    expect(addDays("2026-10-18", -7)).toBe("2026-10-11");
+  });
+  it("writes dates the India way", () => expect(indiaDate("2026-10-08")).toBe("08/10/2026"));
 });

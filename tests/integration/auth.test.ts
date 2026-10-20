@@ -11,8 +11,8 @@ const post = (path: string, body: object) => request(app).post(`${API}${path}`).
 /** A login (or any POST) as if from `ip`: the API trusts X-Forwarded-For from the local proxy, as in production. */
 const postFrom = (ip: string, path: string, body: object) => request(app).post(`${API}${path}`).set("Origin", ORIGIN).set("X-Forwarded-For", ip).send(body);
 /** Asks for a code and waits for its email: the API answers before making it, so a real account answers as fast as an unknown one. */
-async function requestCode(email: string, mails = 1) {
-  expect((await post("/auth/forgot-password", { email })).status).toBe(202);
+async function requestCode(email: string, mails = 1, ip?: string) {
+  expect((await (ip ? postFrom(ip, "/auth/forgot-password", { email }) : post("/auth/forgot-password", { email }))).status).toBe(202);
   await vi.waitFor(() => expect(mailed).toHaveBeenCalledTimes(mails));
   return mailed.mock.calls[mails - 1]![1];
 }
@@ -72,6 +72,14 @@ describe.skipIf(!hasDb)("login, session and logout", () => {
 
     expect((await request(app).post(`${API}/auth/logout`).set("Origin", ORIGIN).set("Cookie", cookie)).status).toBe(204);
     expect((await request(app).get(`${API}/auth/me`).set("Cookie", cookie)).status).toBe(401); // replayed cookie is dead
+  });
+
+  it("a cookie that can't be a session costs no database lookup (it runs before the rate limiters)", async () => {
+    const spy = vi.spyOn(prisma.session, "findUnique");
+    const res = await request(app).get(`${API}/auth/me`).set("Cookie", "mcl_session=not-a-token");
+    expect(res.status).toBe(401);
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
   });
 
   it("rotates the session id on login", async () => {
@@ -190,6 +198,37 @@ describe.skipIf(!hasDb)("forgot password with OTP", () => {
     await prisma.passwordReset.updateMany({ data: { createdAt: new Date(Date.now() - 61_000) } }); // step past the cooldown
     await requestCode(u.email, 2);
     if (first !== mailed.mock.calls[1]![1]) expect((await post("/auth/verify-otp", { email: u.email, otp: first })).status).toBe(400);
+  });
+
+  it("verify answers an unknown email and an inactive account like a wrong code, without a separate user lookup", async () => {
+    const u = await makeUser(["leads"]);
+    const ip = "10.2.0.1"; // its own per-address budget: the file's other tests use up the shared one
+    const otp = await requestCode(u.email, 1, ip);
+    const spy = vi.spyOn(prisma.user, "findUnique"); // a lookup before the code check answered unknown emails sooner
+    expect((await postFrom(ip, "/auth/verify-otp", { email: "ghost@test.local", otp })).body.error.code).toBe("INVALID_OTP");
+    await prisma.user.update({ where: { id: u.user.id }, data: { status: "inactive" } });
+    expect((await postFrom(ip, "/auth/verify-otp", { email: u.email, otp })).body.error.code).toBe("INVALID_OTP");
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+    await prisma.user.update({ where: { id: u.user.id }, data: { status: "active" } });
+    expect((await postFrom(ip, "/auth/verify-otp", { email: u.email, otp })).status).toBe(200); // the code itself was never spent
+  });
+
+  it("sends at most 10 codes a day to one account, however far apart they are asked for", async () => {
+    const u = await makeUser(["leads"]);
+    // Ten earlier codes today, 2 to 20 hours ago: neither the cooldown nor the hourly limit applies.
+    const hoursAgo = (h: number) => new Date(Date.now() - h * 60 * 60_000);
+    await prisma.passwordReset.createMany({
+      data: Array.from({ length: 10 }, (_, i) => ({ userId: u.user.id, otpHash: "x", otpExpiresAt: hoursAgo(1), usedAt: hoursAgo(1), createdAt: hoursAgo(2 + i * 2) })),
+    });
+    const ip = "10.3.0.1";
+    expect((await postFrom(ip, "/auth/forgot-password", { email: u.email })).status).toBe(202);
+    await new Promise((r) => setTimeout(r, 300)); // its (refused) code would be made after the answer
+    expect(mailed).not.toHaveBeenCalled();
+    expect(await prisma.passwordReset.count({ where: { userId: u.user.id } })).toBe(10);
+    // The oldest falls out of the last 24 hours: one more code may be sent.
+    await prisma.passwordReset.updateMany({ where: { userId: u.user.id, createdAt: { lt: hoursAgo(19) } }, data: { createdAt: hoursAgo(25) } });
+    await requestCode(u.email, 1, ip);
   });
 
   it("will not reset without a verified token", async () => {

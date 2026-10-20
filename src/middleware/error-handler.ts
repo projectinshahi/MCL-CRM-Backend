@@ -1,7 +1,7 @@
 import type { ErrorRequestHandler, RequestHandler } from "express";
 import { ZodError } from "zod";
 import { Prisma } from "../generated/prisma/client.ts";
-import { AppError, isUniqueViolation } from "../lib/errors.ts";
+import { AppError, isMissingReference, isUniqueViolation } from "../lib/errors.ts";
 
 export function toAppError(err: unknown): AppError {
   if (err instanceof AppError) return err;
@@ -12,6 +12,7 @@ export function toAppError(err: unknown): AppError {
   if (err instanceof Prisma.PrismaClientKnownRequestError) {
     if (isUniqueViolation(err)) return new AppError(409, "CONFLICT", "A record with the same unique value already exists.");
     if (err.code === "P2003") return new AppError(409, "IN_USE", "This record is still referenced by other records.");
+    if (isMissingReference(err)) return new AppError(409, "REFERENCE_GONE", "Something this refers to was changed or removed meanwhile. Reload and try again.");
     if (err.code === "P2025") return new AppError(404, "NOT_FOUND", "Record not found.");
     if (err.code === "P2034") return new AppError(409, "RETRY", "The data changed while saving. Please try again.");
     if (err.code === "P2028") return new AppError(503, "DB_TIMEOUT", "The database took too long to respond. Nothing was saved. Please try again.");

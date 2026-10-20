@@ -41,6 +41,7 @@ Permission codes:
 - `users`
 - `notifications`
 - `calculator`
+- `modules`
 - `settings`
 - `all_records`
 
@@ -51,7 +52,7 @@ Permission codes:
 | POST | `/auth/login` | public, 5/min per IP+email | `{ email, password, remember? }` → `{ user }` + cookie (30 days if `remember`, else 12 h browser-session cookie). 401 `INVALID_CREDENTIALS`, 403 `ACCOUNT_INACTIVE` |
 | POST | `/auth/logout` | signed in | → 204, session revoked |
 | GET | `/auth/me` | signed in | → `{ user: { id, name, email, phone, initials, role{id,name}, permissions[] } }` |
-| POST | `/auth/forgot-password` | public, rate-limited | `{ email }` → 202 always. Active accounts get a 6-digit code by email: valid 10 min, 60 s between sends, max 5/hour |
+| POST | `/auth/forgot-password` | public, rate-limited | `{ email }` → 202 for every address. Active accounts get a 6-digit code by email: valid 10 min, 60 s between sends, max 5 an hour and 10 a day. Without an email service (`SMTP_URL` + `EMAIL_FROM`) → 503 `EMAIL_UNAVAILABLE` for every address |
 | POST | `/auth/verify-otp` | public, rate-limited | `{ email, otp }` → `{ resetToken }` (valid 15 min). 400 `INVALID_OTP`; 5 wrong tries burn the code |
 | POST | `/auth/reset-password` | public, rate-limited | `{ resetToken, password }` → 204. Every session of that user is revoked. 400 `INVALID_RESET_TOKEN` |
 
@@ -104,15 +105,17 @@ Lead object:
 | GET | `/leads/pipeline` | `q, sourceId, priority, perColumn (≤100, default 20)` → `{ columns: [{ status, count, totalValue, items[] }] }` |
 | GET | `/leads/:id` | → lead, plus `attachments: [{ id, fileName, mimeType, sizeBytes, originalSizeBytes, createdAt }]` (lists and the pipeline never include files) |
 | GET | `/leads/:id/attachments/:attachmentId` | → the file, streamed with its original name (`Content-Disposition: attachment`). Same visibility as the lead (404 otherwise). Files are private Cloudinary assets; no Cloudinary URL is ever returned |
-| PATCH | `/leads/:id` | any create field, plus optional `version` → lead. 409 `STALE_VERSION` if someone saved first. Logs status, owner and detail changes |
+| PATCH | `/leads/:id` | any create field, plus optional `version` → lead. 409 `STALE_VERSION` if someone saved first. Logs status, owner and detail changes. A new `ownerId` also moves the customer created from this lead (see Reassignment) |
 | DELETE | `/leads/:id` | → 204, soft delete |
-| POST | `/leads/:id/assign` | `{ ownerId }` → lead. Active users only. Audited |
+| POST | `/leads/:id/assign` | `{ ownerId }` → lead. Active users only. Audited. 409 `STALE_VERSION` if the lead changed meanwhile. Moves the customer created from this lead too (see Reassignment) |
 | GET | `/leads/:id/activities` | `page` → list of `{ id, type, text, actor{id,name}, createdAt }`, newest first |
-| POST | `/leads/:id/reminders` | `{ title, dueAt (ISO with offset, future), notes? }` → 201 `{ id, title, dueAt, notes, createdAt }`. Stored only; delivery awaits Q18/Q19 |
+| POST | `/leads/:id/reminders` | `{ title, dueAt (ISO with offset, future), notes? }` → 201 `{ id, title, dueAt, notes, createdAt }`. At `dueAt` it becomes a notification for you and the lead's owner |
 | GET | `/leads/:id/conversion` | Needs `leads` **and** `customers`. → `{ alreadyConverted: false, customer (what the new customer would hold), missing: ["name"]?, matches: [customer + matchedOn: email·phone·company] (only customers you may see; others are neither shown nor counted), moveTo: stage \| null }`, or the converted result below when already converted |
 | POST | `/leads/:id/convert` | Needs `leads` **and** `customers`. `{}` or `{ createNew: true }` creates the customer from the lead → 201; `{ customerId }` links the lead to that existing customer (left unchanged) → 200. Response `{ created, alreadyConverted, customer, lead }`. The lead moves to the first won stage and logs `converted`. Once only: a repeat or concurrent request returns the existing customer (200, `alreadyConverted: true`). Errors: 409 `POSSIBLE_DUPLICATE` (matches found and neither `customerId` nor `createNew` sent), 422 `CUSTOMER_NAME_MISSING` (no contact or company name on the lead), 409 `ALREADY_CONVERTED` / `CUSTOMER_DELETED` when its customer isn't visible to you or was deleted |
 
-**Conversion.** Copied once from the lead: contact name (or company name when there is no contact) → `name`; `company`, contact `phone` and `email`, `address`, `district`, company `location` → `companyLocation`, company `email` → `companyEmail`, `customerType` → `type`, source, owner → assignee. Not copied: the description (an internal deal note) and the deal — stage, priority, value, payment, shipment, files — which stay on the lead and are listed on the customer through the link. Later edits to either side never change the other.
+**Conversion.** Copied once from the lead: contact name (or company name when there is no contact) → `name`; `company`, contact `phone` and `email`, `address`, `district`, company `location` → `companyLocation`, company `email` → `companyEmail`, `customerType` → `type`, source, owner → assignee. Not copied: the description (an internal deal note) and the deal — stage, priority, value, payment, shipment, files — which stay on the lead and are listed on the customer through the link. Later edits to either side never change the other, with one exception:
+
+**Reassignment.** When a lead gets a new owner (PATCH `ownerId` or `/assign`), the customer created from it (`customers.lead_id`) moves to that owner in the same statement, unless the customer had already been given to someone other than the lead's previous owner, who then keeps it. Audited as `customer_assigned`. Customers a lead was merely linked to by conversion are not moved.
 
 `paymentStatus` cannot be set through the API yet (report C5).
 
@@ -121,7 +124,7 @@ Lead object:
 | Method | Path | Body / query → response |
 | --- | --- | --- |
 | GET | `/follow-ups` | `q, status (pending·overdue·completed), page, pageSize` → list of `{ id, note, lead{id,label}, type, assignee, status, dueDate, nextFollowUpDate, completedAt, createdAt }` plus `pendingCount`, `overdueCount` |
-| POST | `/follow-ups` | `{ leadId, followUpDate, nextFollowUpDate?, note, type (whatsapp·call·email·meeting), assignedUserId? }` → 201. Assignee defaults to you; the lead must be visible to you |
+| POST | `/follow-ups` | `{ id?, leadId, followUpDate, nextFollowUpDate?, note, type (whatsapp·call·email·meeting), assignedUserId? }` → 201. Assignee defaults to you; the lead must be visible to you. `id` (a UUID the form picks) makes a retry safe: the same `id` again returns the saved follow-up with 200 and records nothing twice; an `id` someone else used → 409 `FOLLOW_UP_ID_TAKEN` |
 | POST | `/follow-ups/:id/complete` | → follow-up (idempotent) |
 | GET | `/follow-ups/history` | `page` → list of `{ lead{id,label}, completedCount, entries[] }` |
 | GET | `/lookups/lead-contacts` | `q?` → `[{ leadId, label }]`, up to 20 visible leads, label "Company - Contact" |
@@ -142,7 +145,11 @@ Lead object:
 | GET | `/customers/:id/activities` | `page, pageSize` → list of `{ id, type (initial·follow_up·call), occurredAt, notes, actor, createdAt }`, most recent first |
 | POST | `/customers/:id/activities` | `{ id? (UUID: the same id again returns the saved entry, 200), type, occurredAt (ISO with offset, not in the future), notes? }` → 201 |
 | GET | `/dashboard/summary` | `{ kpis: { totalLeads, newLeads, activeLeads, convertedLeads, lostLeads, activeCustomers, followUpsDueToday, followUpsOverdue, openLeadValue, convertedValue, conversionRate }, byStatus: [{ status, count }], bySource: [{ source \| null, count, share }] }` |
-| GET | `/notifications` | list of `{ id, title, detail, link, read, createdAt }` plus `unreadCount` |
+| GET | `/notifications` | `page, pageSize` → your own notifications, newest first: list of `{ id, title, detail, link, read, createdAt }` plus `unreadCount`. The title names the record, and `link` is set, only if you may open that record now; otherwise the title is the event alone and `link` is null |
+| GET | `/notifications/unread` | → `{ unreadCount, latestAt, total }`: `latestAt` is when the newest unread one arrived (null: none), `total` counts all of yours. Polled by the header bell; a later `latestAt` (or a higher `unreadCount`) means a new notification, and any change refreshes an open list |
+| POST | `/notifications/:id/read` | → 204. Marks it read (it stays in the list). 404 for an id that isn't yours |
+| DELETE | `/notifications/:id` | → 204. Removes it from your list. 404 for an id that isn't yours, or one already removed |
+| DELETE | `/notifications` | `before?` (ISO date-time: the newest one your list showed) → `{ cleared }`: clear all, yours only, up to `before` when given |
 
 ## Settings
 

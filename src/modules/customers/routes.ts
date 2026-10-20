@@ -8,6 +8,7 @@ import { AppError, invalid, isUniqueViolation, notFound } from "../../lib/errors
 import { checkFile, type FileKind } from "../../lib/files.ts";
 import { blankToNull, dateOnlyStr, email, idParam, listOf, optText, pageQuery, paged, phone, searchQ, text } from "../../lib/http.ts";
 import { logger } from "../../lib/logger.ts";
+import { notify, type Notice } from "../../lib/notify.ts";
 import { prisma } from "../../lib/prisma.ts";
 import * as storage from "../../lib/storage.ts";
 import { discard, formArray, multipartFiles, originalSizes, streamAttachment, uploadAll, type Upload } from "../../lib/uploads.ts";
@@ -153,7 +154,7 @@ customersRouter.patch("/customers/:id", requirePermission("customers"), async (r
   const [current, source, assignee] = await Promise.all([
     prisma.customer.findFirst({ where: { id, ...customerScope(req) }, include: customerInclude }),
     body.sourceId ? prisma.leadSource.findUnique({ where: { id: body.sourceId }, select: { active: true } }) : null,
-    body.assignedUserId ? prisma.user.findUnique({ where: { id: body.assignedUserId }, select: { status: true } }) : null,
+    body.assignedUserId ? prisma.user.findUnique({ where: { id: body.assignedUserId }, select: { status: true, name: true } }) : null,
   ]);
   if (!current) throw notFound("Customer");
   const newSource = body.sourceId && body.sourceId !== current.sourceId ? body.sourceId : null;
@@ -172,6 +173,25 @@ customersRouter.patch("/customers/:id", requirePermission("customers"), async (r
     history: [{ table: "audit_logs", rows: [{ actorId: me(req).id, action: "customer_updated", entityType: "customer", entityId: id, after: { fields: Object.keys(body) }, ip: req.ip }] }],
   });
   if (!saved) throw notFound("Customer"); // deleted meanwhile
+  // A new assignee hears it is theirs (administrators that it moved); administrators and the assignee hear of a
+  // deactivation or reactivation; the assignee of any other change someone else made. Keys: one per save.
+  const at = saved.updatedAt.getTime();
+  const subject = { kind: "customer" as const, id, label: body.name ?? current.name, holderId: newAssignee ?? current.assignedUserId };
+  const holder = (say: { what: string; detail: string }) => (newAssignee ? [] : [{ id: current.assignedUserId, say }]);
+  const status = body.status && body.status !== current.status && { what: body.status === "inactive" ? "Customer deactivated" : "Customer reactivated", detail: `By ${me(req).name}` };
+  const edited = (Object.keys(body) as (keyof typeof body)[]).some((k) => k !== "status" && k !== "assignedUserId" && body[k] !== current[k]);
+  const notices: Notice[] = [];
+  if (newAssignee)
+    notices.push({
+      key: `customer_assigned:${id}:${at}`,
+      actorId: me(req).id,
+      subject,
+      admins: { what: "Customer reassigned", detail: `${me(req).name} assigned it to ${assignee!.name}` },
+      people: [{ id: newAssignee, say: { what: "Customer assigned to you", detail: `Assigned by ${me(req).name}` } }],
+    });
+  if (status) notices.push({ key: `customer_status:${id}:${at}`, actorId: me(req).id, subject, admins: status, people: holder(status) });
+  if (edited) notices.push({ key: `customer_updated:${id}:${at}`, actorId: me(req).id, subject, people: holder({ what: "Customer updated", detail: `${me(req).name} changed its details` }) });
+  void notify(...notices);
   // Activate / Deactivate changes the status only: the customer as read, with it. Other edits are read back.
   const statusOnly = Object.keys(body).every((k) => k === "status");
   const customer = statusOnly
@@ -475,6 +495,9 @@ customersRouter.post("/leads/:id/convert", requirePermission("leads"), requirePe
       });
       return { customer, next: await tx.lead.findUniqueOrThrow({ where: { id }, include: leadInclude }) };
     });
+    // Only the request that converted it gets here (a repeat answers from convertedResult), so this is sent once.
+    const say = { what: existing ? "Lead linked to a customer" : "Lead converted to a customer", detail: `By ${me(req).name}` };
+    void notify({ key: `lead_converted:${id}`, actorId: me(req).id, subject: { kind: "lead", id, label: lead.title, holderId: lead.ownerId }, admins: say, people: [{ id: lead.ownerId, say }] });
     res.status(existing ? 200 : 201).json({ created: !existing, alreadyConverted: false, customer: toCustomer(customer), lead: toLead(next) });
   } catch (err) {
     if (!(err instanceof LeadTaken) && !isUniqueViolation(err)) throw err;

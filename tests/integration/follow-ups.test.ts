@@ -1,5 +1,6 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { todayIST } from "../../src/lib/format.ts";
+import { notificationsSettled } from "../../src/lib/notify.ts";
 import { API, hasDb, makeUser, prisma, resetDb, signedIn } from "../helpers.ts";
 
 const dayOffset = (days: number) => todayIST(new Date(Date.now() + days * 86_400_000));
@@ -28,6 +29,37 @@ describe.skipIf(!hasDb)("follow-ups", () => {
     });
     const activity = (await agent.get(`${API}/leads/${lead.id}/activities`)).body.items[0];
     expect(activity.type).toBe("follow_up_added");
+  });
+
+  it("a retried save (same id) records the follow-up, its activity line and its notification once", async () => {
+    const { agent, lead } = await setup();
+    const admin = await makeUser(["users", "notifications"]); // administrators hear of every new follow-up
+    const id = crypto.randomUUID();
+    const body = { id, leadId: lead.id, followUpDate: dayOffset(1), note: "Call back", type: "call" };
+    const first = await agent.post(`${API}/follow-ups`).send(body);
+    const again = await agent.post(`${API}/follow-ups`).send(body);
+    expect([first.status, again.status]).toEqual([201, 200]);
+    expect(again.body).toMatchObject({ id, note: "Call back", lead: { id: lead.id } });
+    expect(await prisma.followUp.count()).toBe(1);
+    expect(await prisma.leadActivity.count({ where: { leadId: lead.id, type: "follow_up_added" } })).toBe(1);
+    await notificationsSettled();
+    expect(await prisma.notification.count({ where: { userId: admin.user.id, dedupeKey: { startsWith: "fu_created:" } } })).toBe(1);
+    // The same id from someone else is refused and changes nothing.
+    const other = await signedIn(["leads", "follow_ups"]);
+    const theirs = (await other.agent.post(`${API}/leads`).send({ title: "Theirs", contact: { name: "Test Contact" } })).body;
+    const taken = await other.agent.post(`${API}/follow-ups`).send({ ...body, leadId: theirs.id });
+    expect([taken.status, taken.body.error.code]).toEqual([409, "FOLLOW_UP_ID_TAKEN"]);
+    expect(await prisma.followUp.count()).toBe(1);
+  });
+
+  it("an assignee removed between the check and the save is a 409, not a server error", async () => {
+    const { agent, lead } = await setup();
+    const ghost = crypto.randomUUID();
+    // The check sees an active user who is gone by the time the follow-up is written (foreign key, raw statement).
+    vi.spyOn(prisma.user, "findUnique").mockResolvedValueOnce({ id: ghost, name: "Gone", status: "active" } as never);
+    const res = await agent.post(`${API}/follow-ups`).send({ leadId: lead.id, followUpDate: dayOffset(1), note: "x", type: "call", assignedUserId: ghost });
+    expect([res.status, res.body.error.code]).toEqual([409, "REFERENCE_GONE"]);
+    expect(await prisma.followUp.count()).toBe(0);
   });
 
   it("validates note, date, type, lead scope and assignee", async () => {

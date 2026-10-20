@@ -22,6 +22,11 @@ export default defineConfig({
       DATABASE_POOL_MAX: process.env.DATABASE_POOL_MAX ?? (local ? "1" : "5"),
       FRONTEND_ORIGIN: "http://localhost:3001,http://localhost:3000", // both dev ports: see the origin test in auth.test.ts
       SESSION_SECRET: "test-only-secret-test-only-secret-0000",
+      // The tests stand in for the proxy (X-Forwarded-For from supertest on 127.0.0.1) and for the mail server
+      // (tests/integration/auth.test.ts mocks the mailer; nothing is sent to this address).
+      TRUST_PROXY: "loopback",
+      SMTP_URL: "smtp://127.0.0.1:2525",
+      EMAIL_FROM: "MCL CRM tests <no-reply@test.local>",
       // Tests replace the Cloudinary module (tests/integration/attachments.test.ts); these only switch uploads on,
       // and keep anything that slipped through away from real files.
       CLOUDINARY_CLOUD_NAME: process.env.CLOUDINARY_CLOUD_NAME ?? "test-cloud",

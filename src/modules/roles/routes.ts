@@ -6,6 +6,7 @@ import { AppError, notFound } from "../../lib/errors.ts";
 import { initials } from "../../lib/format.ts";
 import { assertAdminRemains } from "../../lib/guards.ts";
 import { idParam, text } from "../../lib/http.ts";
+import { notify, type Say } from "../../lib/notify.ts";
 import { PERMISSION_CODES } from "../../lib/permissions.ts";
 
 /** Position in the catalogue (= sidebar order); lists of permissions follow it. */
@@ -51,6 +52,10 @@ async function assertNameFree(name: string, exceptId?: string) {
   if (taken && taken.id !== exceptId) throw new AppError(409, "ROLE_NAME_TAKEN", "A role with this name already exists.", { name: "Already in use" });
 }
 
+/** Role and permission changes go to administrators (lib/notify.ts). */
+const roleNotice = (actorId: string, role: { id: string; name: string }, key: string, say: Say, gone = false) =>
+  notify({ key, actorId, subject: { kind: "role", id: role.id, label: role.name, holderId: null, gone }, admins: say });
+
 export const rolesRouter = Router();
 
 // In catalogue order (the sidebar's, All Records last), not alphabetical.
@@ -77,6 +82,8 @@ rolesRouter.post("/roles", requirePermission("users"), async (req, res) => {
     }),
     audit(prisma, { actorId: me(req).id, action: "role_created", entityType: "role", entityId: id, after: body, ip: req.ip }),
   ]);
+  const count = body.permissions.length;
+  void roleNotice(me(req).id, { id, name: body.name }, `role_created:${id}`, { what: "Role created", detail: `${me(req).name} created it with ${count} permission${count === 1 ? "" : "s"}` });
   res.status(201).json({ id, name: body.name, permissions: [...body.permissions].sort((a, b) => rank(a) - rank(b)), userCount: 0, members: [], extraMembers: 0 });
 });
 
@@ -114,6 +121,15 @@ rolesRouter.patch("/roles/:id", requirePermission("users"), async (req, res) => 
     },
     { isolationLevel: "Serializable" },
   );
+  if (permissionsChanged || name !== current.name)
+    void roleNotice(
+      me(req).id,
+      { id, name },
+      `role_updated:${id}:${randomUUID()}`,
+      permissionsChanged
+        ? { what: "Role permissions changed", detail: `${me(req).name} changed what this role can open` }
+        : { what: "Role renamed", detail: `${me(req).name} renamed it from ${current.name}` },
+    );
   // Members and user count are unchanged by an edit, so they come from the row read above.
   res.json({ ...before, name, permissions });
 });
@@ -127,5 +143,6 @@ rolesRouter.delete("/roles/:id", requirePermission("users"), async (req, res) =>
     prisma.role.delete({ where: { id } }),
     audit(prisma, { actorId: me(req).id, action: "role_deleted", entityType: "role", entityId: id, before: { name: current.name }, ip: req.ip }),
   ]);
+  void roleNotice(me(req).id, current, `role_deleted:${id}`, { what: "Role deleted", detail: `Deleted by ${me(req).name}` }, true);
   res.status(204).end();
 });

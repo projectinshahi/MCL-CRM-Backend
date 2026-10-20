@@ -1,4 +1,4 @@
-import { Readable } from "node:stream";
+import { pipeline, Readable } from "node:stream";
 import type { Request, RequestHandler, Response } from "express";
 import multer from "multer";
 import { AppError, invalid } from "./errors.ts";
@@ -81,5 +81,9 @@ export async function streamAttachment(res: Response, a: { publicId: string; res
   });
   const length = upstream.headers.get("content-length");
   if (length) res.set("Content-Length", length);
-  Readable.fromWeb(upstream.body as import("node:stream/web").ReadableStream).pipe(res);
+  // pipeline, not pipe: Cloudinary dropping the connection mid-file is an error on the source stream, which pipe()
+  // leaves unhandled — an uncaught exception that stopped the whole API. Now the download is cut off and logged.
+  pipeline(Readable.fromWeb(upstream.body as import("node:stream/web").ReadableStream), res, (err) => {
+    if (err && !res.writableFinished) logger.warn({ publicId: a.publicId, reason: err.message }, "attachment download interrupted");
+  });
 }

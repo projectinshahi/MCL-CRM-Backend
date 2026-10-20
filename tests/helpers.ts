@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import request from "supertest";
 import { seed } from "../prisma/seed.ts";
 import { createApp } from "../src/app.ts";
+import { notificationsSettled } from "../src/lib/notify.ts";
 import type { PermissionCode } from "../src/lib/permissions.ts";
 import { prisma } from "../src/lib/prisma.ts";
 
@@ -18,6 +19,7 @@ const TABLES = [
 ];
 
 export async function resetDb() {
+  await notificationsSettled(); // the previous test's background saves land before their users are wiped
   await prisma.$executeRawUnsafe(`TRUNCATE TABLE ${TABLES.map((t) => `"${t}"`).join(", ")} RESTART IDENTITY CASCADE`);
   await seed(prisma);
 }

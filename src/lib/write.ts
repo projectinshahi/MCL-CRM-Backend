@@ -32,12 +32,13 @@ export function insertRows(table: "leads" | "lead_attachments", rows: object[]) 
  * inserts `history` rows (model fields, camelCase) only if the update happened. `version` adds an optimistic-lock
  * condition; a versioned table's version always goes up by one. The API's clock stamps updated_at and the history
  * rows' created_at, as Prisma's @updatedAt does. Returns the row's new updatedAt (and version), or null when no live
- * row matched (deleted, or no longer at `version`).
+ * row matched (deleted, or no longer at `version`). `also`: further WITH clauses (", name AS (…)") of the same
+ * statement, each acting only WHERE EXISTS (SELECT FROM upd).
  */
 export async function updateWithHistory(
   table: Table,
   id: string,
-  { set, version, history = [] }: { set: object; version?: number; history?: { table: HistoryTable; rows: object[] }[] },
+  { set, version, history = [], also = [] }: { set: object; version?: number; history?: { table: HistoryTable; rows: object[] }[]; also?: Prisma.Sql[] },
 ) {
   const now = new Date();
   const fields = Object.keys(set).map(snake);
@@ -62,7 +63,7 @@ export async function updateWithHistory(
       UPDATE ${Prisma.raw(table)} SET ${assign} ${versioned ? Prisma.sql`version = version + 1,` : Prisma.empty} updated_at = ${now}
       WHERE id = ${id}::uuid ${table === "follow_ups" ? Prisma.empty : Prisma.sql`AND deleted_at IS NULL`} ${version === undefined ? Prisma.empty : Prisma.sql`AND version = ${version}`}
       RETURNING updated_at${versioned ? Prisma.raw(", version") : Prisma.empty}
-    )${inserts.length ? Prisma.join(inserts, "") : Prisma.empty}
+    )${inserts.length ? Prisma.join(inserts, "") : Prisma.empty}${also.length ? Prisma.join(also, "") : Prisma.empty}
     SELECT * FROM upd`;
   return row ? { updatedAt: row.updated_at, ...(versioned && { version: row.version! }) } : null;
 }

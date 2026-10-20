@@ -20,7 +20,13 @@ const limiter = (windowMs: number, limit: number, keyGenerator?: Options["keyGen
 // "a@b.co " are one account, so they must be one counter.
 const account = (req: Parameters<NonNullable<Options["keyGenerator"]>>[0]) => String(req.body?.email ?? "").trim().toLowerCase();
 
-export const apiLimiter = limiter(60_000, 300);
+// Browsers reach the API through the Next.js /api rewrite, which forwards no client address: every request arrives
+// from that server. Keyed by address alone, the whole team shared one budget, and once it ran out everyone's requests
+// (the notification poll among them) failed with 429. So, once the session is known, signed-in users each get their
+// own 300 a minute (userLimiter) and don't count towards anything shared; requests without a session share 300 a
+// minute per address, under a 3000 a minute per-address ceiling (apiLimiter).
+export const apiLimiter = limiter(60_000, 3000, undefined, { skip: (req) => !!req.auth });
+export const userLimiter = limiter(60_000, 300, (req) => (req.auth ? `user|${req.auth.user.id}` : ipKeyGenerator(req.ip ?? "")));
 // Login: 5 attempts per minute per IP + email (report section 9 proposal).
 export const loginLimiter = limiter(60_000, 5, (req) => `${ipKeyGenerator(req.ip ?? "")}|${account(req)}`);
 // And per account from all addresses together, failed sign-ins only: guessing one password stays slow even from

@@ -7,6 +7,7 @@ import { audit } from "../../lib/audit.ts";
 import { AppError, invalid, isUniqueViolation, notFound } from "../../lib/errors.ts";
 import { assertAdminRemains } from "../../lib/guards.ts";
 import { email, idParam, listOf, pageQuery, paged, password, phone, blankToNull, searchQ, text } from "../../lib/http.ts";
+import { notify, type Say } from "../../lib/notify.ts";
 import { prisma } from "../../lib/prisma.ts";
 import { me, requirePermission } from "../../middleware/auth.ts";
 
@@ -44,6 +45,10 @@ const snapshot = (u: { name: string; email: string; phone: string | null; status
   status: u.status,
   roleId: u.role.id,
 });
+
+/** Account changes go to administrators (lib/notify.ts); the key is unique per change. gone: the account was deleted. */
+const userNotice = (actor: { id: string }, user: { id: string; name: string }, say: Say, key = `user_updated:${user.id}:${randomUUID()}`, gone = false) =>
+  notify({ key, actorId: actor.id, subject: { kind: "user", id: user.id, label: user.name, holderId: null, gone }, admins: say });
 
 const emailTaken = () => new AppError(409, "EMAIL_TAKEN", "A user with this email already exists.", { email: "Already in use" });
 
@@ -107,6 +112,16 @@ usersRouter.post("/users", requirePermission("users"), async (req, res) => {
     .catch((e) => {
       throw isUniqueViolation(e) ? emailTaken() : e; // lost a race with another create using the same email
     });
+  // Every other active user hears of a new colleague (their name only: no email, phone or role); administrators get
+  // the account itself ("User added: <name>", with the role and a link to Users). The new user is not told.
+  void notify({
+    key: `user_created:${id}`,
+    actorId: me(req).id,
+    subject: { kind: "user", id, label: user.name, holderId: null },
+    admins: { what: "User added", detail: `${me(req).name} added them as ${role.name}` },
+    everyone: { what: "New team member", detail: `${user.name}, added by ${me(req).name}` },
+    skip: id,
+  });
   res.status(201).json({ ...user, role, assignedLeads: 0, convertedLeads: 0 });
 });
 
@@ -143,6 +158,18 @@ usersRouter.patch("/users/:id", requirePermission("users"), async (req, res) => 
     },
     { isolationLevel: "Serializable" },
   );
+  // A save that changed nothing (the form sends every field) tells nobody.
+  const by = me(req).name;
+  const changed = !!passwordHash || JSON.stringify(snapshot(current)) !== JSON.stringify(snapshot(user));
+  const say =
+    !changed
+      ? null
+      : user.status !== current.status
+      ? { what: user.status === "inactive" ? "User deactivated" : "User reactivated", detail: `By ${by}` }
+      : user.role.id !== current.role.id
+        ? { what: "User role changed", detail: `${by} changed their role from ${current.role.name} to ${user.role.name}` }
+        : { what: "User updated", detail: `${by} updated their account` };
+  if (say) void userNotice(me(req), user, say);
   res.json(user);
 });
 
@@ -163,12 +190,21 @@ usersRouter.delete("/users/:id", requirePermission("users"), async (req, res) =>
     },
     { isolationLevel: "Serializable" },
   );
+  let deleted = false;
   try {
-    await prisma.user.delete({ where: { id } });
-    await audit(prisma, { actorId: me(req).id, action: "user_deleted", entityType: "user", entityId: id, ip: req.ip });
+    // Together, so a deleted account always has its audit row and is reported as removed.
+    await prisma.$transaction([
+      prisma.user.delete({ where: { id } }),
+      audit(prisma, { actorId: me(req).id, action: "user_deleted", entityType: "user", entityId: id, ip: req.ip }),
+    ]);
+    deleted = true;
   } catch {
     // Referenced by business or audit records: it stays as an inactive user.
   }
+  // An account that was already inactive and is kept changed nothing; a deleted one is named in full now (it can't be
+  // looked up later).
+  if (deleted) void userNotice(me(req), current, { what: "User removed", detail: `By ${me(req).name}` }, `user_removed:${id}`, true);
+  else if (current.status === "active") void userNotice(me(req), current, { what: "User deactivated", detail: `By ${me(req).name}` });
   res.status(204).end();
 });
 

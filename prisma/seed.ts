@@ -36,8 +36,9 @@ export async function seed(prisma: PrismaClient) {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const url = process.env.DIRECT_URL ?? process.env.DATABASE_URL;
-  if (!url) throw new Error("Set DIRECT_URL or DATABASE_URL");
+  // The same order as prisma.config.ts: the direct endpoint when there is one (DATABASE_UNPOOLED_URL is Neon's name).
+  const url = process.env.DIRECT_URL ?? process.env.DATABASE_UNPOOLED_URL ?? process.env.DATABASE_URL;
+  if (!url) throw new Error("Set DIRECT_URL (or DATABASE_UNPOOLED_URL, or DATABASE_URL)");
   const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: url }) });
   await seed(prisma);
   await prisma.$disconnect();

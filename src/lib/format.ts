@@ -15,6 +15,10 @@ export const todayIST = (now = new Date()) => istDay.format(now); // "YYYY-MM-DD
 
 export const dateOnly = (d: Date) => d.toISOString().slice(0, 10);
 export const parseDateOnly = (s: string) => new Date(`${s}T00:00:00.000Z`);
+/** The "YYYY-MM-DD" `n` days after `day` (before, if negative). UTC has no DST, so month ends and leap days just work. */
+export const addDays = (day: string, n: number) => dateOnly(new Date(parseDateOnly(day).getTime() + n * 86_400_000));
+/** "18/10/2026", as dates are written in India. */
+export const indiaDate = (day: string) => day.split("-").reverse().join("/");
 
 // Overdue is derived, never stored: a pending follow-up whose due date is before today (IST).
 export function followUpStatus(status: "pending" | "completed", dueDate: Date, today = todayIST()) {

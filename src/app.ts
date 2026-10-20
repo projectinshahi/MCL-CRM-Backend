@@ -7,7 +7,7 @@ import { logger } from "./lib/logger.ts";
 import { prisma } from "./lib/prisma.ts";
 import { loadSession } from "./middleware/auth.ts";
 import { errorHandler, notFoundRoute } from "./middleware/error-handler.ts";
-import { apiLimiter, originCheck } from "./middleware/security.ts";
+import { apiLimiter, originCheck, userLimiter } from "./middleware/security.ts";
 import { authRouter } from "./modules/auth/routes.ts";
 import { customersRouter } from "./modules/customers/routes.ts";
 import { dashboardRouter } from "./modules/dashboard/routes.ts";
@@ -20,8 +20,8 @@ import { usersRouter } from "./modules/users/routes.ts";
 
 export function createApp() {
   const app = express();
-  // Behind the Next.js /api proxy (and any load balancer): needed for the real client IP in rate limits and logs.
-  app.set("trust proxy", /^\d+$/.test(env.TRUST_PROXY) ? Number(env.TRUST_PROXY) : env.TRUST_PROXY);
+  // Which proxies may report the client's address (rate limits, logs): see TRUST_PROXY in config/env.ts.
+  app.set("trust proxy", env.TRUST_PROXY);
   app.use(helmet());
   app.use(
     pinoHttp({
@@ -50,7 +50,7 @@ export function createApp() {
   // Answers carry one user's records: never stored by the browser or any cache in between (a shared computer keeps
   // nobody's data, and a role change is never hidden behind a cached copy).
   const noStore: express.RequestHandler = (_req, res, next) => (res.set("Cache-Control", "no-store"), next());
-  api.use(noStore, apiLimiter, express.json({ limit: "100kb" }), originCheck, loadSession);
+  api.use(noStore, express.json({ limit: "100kb" }), originCheck, loadSession, apiLimiter, userLimiter);
   api.use(authRouter, usersRouter, rolesRouter, settingsRouter, leadsRouter, followUpsRouter, customersRouter, dashboardRouter, notificationsRouter);
   app.use("/api/v1", api);
 

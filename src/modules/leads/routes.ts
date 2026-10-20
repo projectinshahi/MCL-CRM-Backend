@@ -7,11 +7,13 @@ import { AppError, invalid, isUniqueViolation, notFound } from "../../lib/errors
 import { checkFile, type FileKind } from "../../lib/files.ts";
 import { toMoney } from "../../lib/format.ts";
 import { blankToNull, email, idParam, listOf, money, optText, pageQuery, paged, phone, searchQ, text, weightKg } from "../../lib/http.ts";
+import { notify, type Notice } from "../../lib/notify.ts";
 import { prisma } from "../../lib/prisma.ts";
 import * as storage from "../../lib/storage.ts";
 import { discard, multipartFiles, originalSizes, streamAttachment, uploadAll, type Upload } from "../../lib/uploads.ts";
 import { insertRows, updateWithHistory } from "../../lib/write.ts";
 import { me, requirePermission, seesAll } from "../../middleware/auth.ts";
+import { scheduleReminders } from "../notifications/reminders.ts";
 
 const PRIORITIES = ["low", "medium", "high"] as const;
 const SHIPMENT_TYPES = ["air", "water"] as const;
@@ -179,6 +181,39 @@ async function checkReferences(refs: Refs) {
 
 const stale = () => new AppError(409, "STALE_VERSION", "This lead was changed by someone else. Reload it and try again.");
 
+/** Whether a sent value differs from the stored one: amounts as numbers ("249000.50" = 249000.5), blank = null. */
+function differs(sent: unknown, stored: unknown) {
+  if (sent == null || stored == null) return (sent == null) !== (stored == null) && String(sent ?? stored) !== "";
+  return typeof stored === "object" && "toFixed" in stored ? Number(sent) !== Number(stored) : String(sent) !== String(stored);
+}
+
+/** A lead handed to someone (lib/notify.ts): they hear it is theirs now, administrators that it moved. */
+const assigned = (req: Request, lead: { id: string; title: string }, owner: { id: string; name: string }, version: number): Notice => ({
+  key: `lead_assigned:${lead.id}:${version}`,
+  actorId: me(req).id,
+  subject: { kind: "lead", id: lead.id, label: lead.title, holderId: owner.id },
+  admins: { what: "Lead reassigned", detail: `${me(req).name} assigned it to ${owner.name}` },
+  people: [{ id: owner.id, say: { what: "Lead assigned to you", detail: `Assigned by ${me(req).name}` } }],
+});
+
+/**
+ * Business rule (owner's decision, 17 Oct 2026): a reassigned lead takes the customer created from it along to its
+ * new owner, unless that customer had already been given to someone else, who keeps it. A clause of the lead's own
+ * update statement (lib/write.ts `also`): both change, or neither. The move is in the audit trail.
+ */
+const customerFollows = (req: Request, leadId: string, from: string | null, to: string) => {
+  const now = new Date();
+  return Prisma.sql`, moved AS (
+      UPDATE customers SET assigned_user_id = ${to}::uuid, updated_at = ${now}
+      WHERE lead_id = ${leadId}::uuid AND deleted_at IS NULL AND assigned_user_id IS NOT DISTINCT FROM ${from}::uuid AND EXISTS (SELECT FROM upd)
+      RETURNING id
+    ), moved_audit AS (
+      INSERT INTO audit_logs (actor_id, action, entity_type, entity_id, before, after, ip, created_at)
+      SELECT ${me(req).id}::uuid, 'customer_assigned', 'customer', moved.id::text, ${JSON.stringify({ assignedUserId: from })}::jsonb,
+             ${JSON.stringify({ assignedUserId: to, withLead: leadId })}::jsonb, ${req.ip ?? null}, ${now} FROM moved
+    )`;
+};
+
 async function findLead(req: Request, id: string) {
   const lead = await prisma.lead.findFirst({ where: { id, ...leadScope(req) }, include: leadInclude });
   if (!lead) throw notFound("Lead"); // outside the caller's scope looks exactly like "does not exist"
@@ -274,9 +309,17 @@ function formBody(req: Request) {
   }
 }
 
-/** The lead a repeated create already saved, if it is the caller's; an id used by anyone else is refused. */
+/**
+ * The lead a repeated create already saved, if the caller created it; an id used by anyone else is refused. A lead
+ * made for a colleague is outside its creator's scope, so it is recognised only shortly after (a retry): refusing
+ * it made the form say "could not be created", and trying again saved a second lead and customer.
+ */
 async function alreadyCreated(req: Request, id: string) {
-  const lead = await prisma.lead.findFirst({ where: { id, createdById: me(req).id, ...leadScope(req) }, include: detailInclude });
+  const recent = { createdAt: { gte: new Date(Date.now() - 10 * 60_000) } };
+  const lead = await prisma.lead.findFirst({
+    where: { id, createdById: me(req).id, deletedAt: null, ...(seesAll(req) ? {} : { OR: [{ ownerId: me(req).id }, recent] }) },
+    include: detailInclude,
+  });
   if (lead) return lead;
   if (await prisma.lead.count({ where: { id } })) throw new AppError(409, "LEAD_ID_TAKEN", "This lead could not be created. Close the form and try again.");
   return null;
@@ -361,6 +404,15 @@ leadsRouter.post("/leads", requirePermission("leads"), multipartFiles, async (re
     if (replay) return void res.status(200).json(toLead(replay));
     throw err;
   }
+  // Saved (a replayed create returned above, so a retry never notifies twice): administrators hear of every new lead,
+  // its owner too when someone else created it for them.
+  void notify({
+    key: `lead_created:${id}`,
+    actorId: me(req).id,
+    subject: { kind: "lead", id, label: body.title, holderId: ownerId },
+    admins: { what: "New lead", detail: `Created by ${me(req).name}, together with its customer` },
+    people: [{ id: ownerId, say: { what: "Lead assigned to you", detail: `Created by ${me(req).name}` } }],
+  });
   const lead = await prisma.lead.findUniqueOrThrow({ where: { id }, include: detailInclude, relationLoadStrategy: "join" });
   res.status(201).json(toLead(lead));
 });
@@ -412,8 +464,23 @@ leadsRouter.patch("/leads/:id", requirePermission("leads"), async (req, res) => 
     version: current.version,
     set: columns,
     history: [{ table: "lead_activities", rows: activities }, { table: "audit_logs", rows: audits }],
+    also: changed.ownerId ? [customerFollows(req, id, current.ownerId, changed.ownerId)] : [],
   });
   if (!saved) throw stale();
+  // Administrators hear of a stage move or a new owner; the owner of any change someone else made to their lead. A new
+  // owner hears "assigned to you" alone, not each change that came with it. Keys carry the new version: one per edit.
+  const subject = { kind: "lead" as const, id, label: body.title ?? current.title, holderId: changed.ownerId ?? current.ownerId };
+  const owner = (say: { what: string; detail: string }) => (changed.ownerId ? [] : [{ id: current.ownerId, say }]);
+  const stage = found.status && { what: `Lead moved to ${found.status.name}`, detail: `${me(req).name} moved it from ${current.status.name} to ${found.status.name}` };
+  const notices: Notice[] = [];
+  if (changed.ownerId) notices.push(assigned(req, { id, title: subject.label }, found.owner!, saved.version!));
+  if (changed.statusId && stage) notices.push({ key: `lead_stage:${id}:${saved.version}`, actorId: me(req).id, subject, admins: stage, people: owner(stage) });
+  // The edit form sends every field, so only values that really changed make an edit worth telling the owner about.
+  const values = columns as Record<string, unknown>;
+  const stored = current as unknown as Record<string, unknown>;
+  if (other.some((k) => differs(values[k], stored[k])))
+    notices.push({ key: `lead_updated:${id}:${saved.version}`, actorId: me(req).id, subject, people: owner({ what: "Lead updated", detail: `${me(req).name} changed its details` }) });
+  void notify(...notices);
   // Only the stage and/or owner changed (a pipeline move): that is the lead as read, plus what changed — exact,
   // since the version check proves nothing else changed in between. Any other edit is read back (one round trip).
   if (!other.length) {
@@ -435,6 +502,8 @@ leadsRouter.delete("/leads/:id", requirePermission("leads"), async (req, res) =>
     ],
   });
   if (!saved) throw notFound("Lead"); // deleted by someone else meanwhile
+  const say = { what: "Lead deleted", detail: `Deleted by ${me(req).name}` };
+  void notify({ key: `lead_deleted:${id}`, actorId: me(req).id, subject: { kind: "lead", id, label: current.title, holderId: current.ownerId, gone: true }, admins: say, people: [{ id: current.ownerId, say }] });
   res.status(204).end();
 });
 
@@ -445,14 +514,19 @@ leadsRouter.post("/leads/:id/assign", requirePermission("leads"), async (req, re
   if (current.ownerId === ownerId) return void res.json(toLead(current));
   refuseBadReferences({ ownerId }, found);
 
+  // At the version read above: the reply is that read plus the new owner, which must not hide someone else's edit
+  // made in between (the client would hold stale fields at the latest version, and its next save would undo it).
   const saved = await updateWithHistory("leads", id, {
+    version: current.version,
     set: { ownerId },
     history: [
       { table: "lead_activities", rows: [{ leadId: id, actorId: me(req).id, type: "assigned", message: `Assigned to ${found.owner!.name}` }] },
       { table: "audit_logs", rows: [{ actorId: me(req).id, action: "lead_assigned", entityType: "lead", entityId: id, before: { ownerId: current.ownerId }, after: { ownerId }, ip: req.ip }] },
     ],
+    also: [customerFollows(req, id, current.ownerId, ownerId)],
   });
-  if (!saved) throw notFound("Lead"); // deleted meanwhile
+  if (!saved) throw stale(); // changed or deleted meanwhile
+  void notify(assigned(req, current, found.owner!, saved.version!));
   res.json(toLead({ ...current, updatedAt: saved.updatedAt, version: saved.version!, ownerId, owner: { id: found.owner!.id, name: found.owner!.name } }));
 });
 
@@ -475,7 +549,7 @@ leadsRouter.get("/leads/:id/activities", requirePermission("leads"), async (req,
   res.json(listOf(items, q, total));
 });
 
-// Stored only: who gets reminded and how (in-app, email…) awaits report Q18/Q19.
+// Delivered at dueAt as a notification to its creator and the lead's owner (modules/notifications/reminders.ts).
 leadsRouter.post("/leads/:id/reminders", requirePermission("leads"), async (req, res) => {
   const id = idParam(req);
   const body = z
@@ -492,5 +566,6 @@ leadsRouter.post("/leads/:id/reminders", requirePermission("leads"), async (req,
     await tx.leadActivity.create({ data: { leadId: id, actorId: me(req).id, type: "reminder_scheduled", message: `Reminder scheduled: ${body.title}` } });
     return r;
   });
+  scheduleReminders(reminder.dueAt.getTime()); // the reminder timer wakes up for it, if it falls due before the next run
   res.status(201).json({ id: reminder.id, title: reminder.title, dueAt: reminder.dueAt, notes: reminder.notes, createdAt: reminder.createdAt });
 });

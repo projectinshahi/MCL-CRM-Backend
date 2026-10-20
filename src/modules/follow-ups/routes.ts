@@ -2,15 +2,26 @@ import { randomUUID } from "node:crypto";
 import { Router, type Request } from "express";
 import { z } from "zod";
 import type { Prisma } from "../../generated/prisma/client.ts";
-import { invalid, notFound } from "../../lib/errors.ts";
-import { dateOnly, followUpStatus, leadLabel, parseDateOnly, todayIST } from "../../lib/format.ts";
+import { AppError, invalid, notFound } from "../../lib/errors.ts";
+import { dateOnly, followUpStatus, indiaDate, leadLabel, parseDateOnly, todayIST } from "../../lib/format.ts";
 import { blankToNull, dateOnlyStr, idParam, listOf, pageQuery, paged, searchQ, text } from "../../lib/http.ts";
+import { notify, type Say } from "../../lib/notify.ts";
 import { prisma } from "../../lib/prisma.ts";
 import { updateWithHistory } from "../../lib/write.ts";
 import { me, requirePermission, seesAll } from "../../middleware/auth.ts";
 import { leadScope } from "../leads/routes.ts";
 
 const TYPES = ["whatsapp", "call", "email", "meeting"] as const;
+const TYPE_LABEL = { whatsapp: "WhatsApp", call: "Call", email: "Email", meeting: "Meeting" } as const;
+
+/** A follow-up event (lib/notify.ts): administrators hear of it, and its assignee unless they did it themselves. */
+const followUpNotice = (req: Request, key: string, f: Pick<Row, "id" | "assignedUserId" | "lead">, admins: Say, assignee: Say | null, gone = false) => ({
+  key,
+  actorId: me(req).id,
+  subject: { kind: "follow_up" as const, id: f.id, label: leadLabel(f.lead), holderId: f.assignedUserId, gone },
+  admins,
+  people: assignee ? [{ id: f.assignedUserId, say: assignee }] : [],
+});
 
 /** Follow-ups the caller may see: on a live lead, and assigned to them unless their role has "all_records". */
 export const followUpScope = (req: Request): Prisma.FollowUpWhereInput => ({
@@ -48,6 +59,7 @@ function statusWhere(status: "pending" | "overdue" | "completed" | undefined, to
 
 const createBody = z
   .object({
+    id: z.uuid().optional(), // chosen by the form, so a retried save is not recorded twice
     leadId: z.uuid("Select a lead"),
     followUpDate: z.iso.date("Pick a follow-up date"),
     nextFollowUpDate: blankToNull(dateOnlyStr),
@@ -56,7 +68,7 @@ const createBody = z
     assignedUserId: z.uuid().optional(),
   })
   .strict();
-const updateBody = createBody.omit({ leadId: true }).partial().strict();
+const updateBody = createBody.omit({ id: true, leadId: true }).partial().strict();
 
 export const followUpsRouter = Router();
 
@@ -112,17 +124,24 @@ followUpsRouter.post("/follow-ups", requirePermission("follow_ups"), async (req,
 
   // The follow-up and its line in the lead's activity are ONE statement: a single round trip, all or nothing (a
   // Prisma transaction made five sequential round trips). The reply is built from what was just checked and saved.
-  const id = randomUUID();
+  const id = body.id ?? randomUUID();
   const now = new Date();
   const actor = me(req).id;
-  await prisma.$executeRaw`
+  const inserted = await prisma.$executeRaw`
     WITH f AS (
       INSERT INTO follow_ups (id, lead_id, note, type, assigned_user_id, due_date, next_follow_up_date, created_by, created_at, updated_at)
       VALUES (${id}::uuid, ${body.leadId}::uuid, ${body.note}, ${body.type}::"FollowUpType", ${assignedUserId}::uuid, ${body.followUpDate}::date, ${body.nextFollowUpDate ?? null}::date, ${actor}::uuid, ${now}, ${now})
+      ON CONFLICT (id) DO NOTHING
       RETURNING lead_id
     )
     INSERT INTO lead_activities (id, lead_id, actor_id, type, message, created_at)
     SELECT ${randomUUID()}::uuid, lead_id, ${actor}::uuid, 'follow_up_added', ${`Follow-up added: ${body.note}`}, ${now} FROM f`;
+  if (!inserted) {
+    // The same form sent again (a retry after a lost reply, say): the first save stands, and is not announced twice.
+    const first = await prisma.followUp.findFirst({ where: { id, createdById: actor, lead: { deletedAt: null } }, include });
+    if (!first) throw new AppError(409, "FOLLOW_UP_ID_TAKEN", "This follow-up could not be added. Close the form and try again.");
+    return void res.status(200).json(toFollowUp(first, todayIST()));
+  }
   const followUp: Row = {
     id,
     leadId: body.leadId,
@@ -139,6 +158,16 @@ followUpsRouter.post("/follow-ups", requirePermission("follow_ups"), async (req,
     lead: lead!,
     assignee: { id: assignee!.id, name: assignee!.name },
   };
+  const what = `${TYPE_LABEL[body.type]} on ${indiaDate(body.followUpDate)}`;
+  void notify(
+    followUpNotice(
+      req,
+      `fu_created:${id}`,
+      followUp,
+      { what: "New follow-up", detail: `${me(req).name} scheduled a ${what}, assigned to ${assignee!.name}` },
+      { what: "Follow-up assigned to you", detail: `${me(req).name} scheduled a ${what}` },
+    ),
+  );
   res.status(201).json(toFollowUp(followUp, todayIST()));
 });
 
@@ -159,6 +188,10 @@ followUpsRouter.post("/follow-ups/:id/complete", requirePermission("follow_ups")
     )
     INSERT INTO lead_activities (id, lead_id, actor_id, type, message, created_at)
     SELECT ${randomUUID()}::uuid, lead_id, ${me(req).id}::uuid, 'follow_up_completed', ${`Follow-up completed: ${current.note}`}, ${now} FROM upd`;
+  if (completed) {
+    const say = { what: "Follow-up completed", detail: `Completed by ${me(req).name}` };
+    void notify(followUpNotice(req, `fu_completed:${id}`, current, say, say));
+  }
   const done = completed ? { ...current, status: "completed" as const, completedAt: now, updatedAt: now } : await prisma.followUp.findUniqueOrThrow({ where: { id }, include });
   res.json(toFollowUp(done, todayIST()));
 });
@@ -189,6 +222,17 @@ followUpsRouter.patch("/follow-ups/:id", requirePermission("follow_ups"), async 
     history: [{ table: "lead_activities", rows: [{ leadId: current.leadId, actorId: me(req).id, type: "follow_up_updated", message: `Follow-up updated: ${set.note ?? current.note}`, data: { fields: Object.keys(set) } }] }],
   });
   if (!saved) throw notFound("Follow-up"); // deleted meanwhile
+  // A new assignee hears it is theirs now; otherwise the assignee hears of the change. Administrators either way.
+  const by = me(req).name;
+  void notify(
+    followUpNotice(
+      req,
+      `fu_updated:${id}:${saved.updatedAt.getTime()}`,
+      { ...current, assignedUserId: set.assignedUserId ?? current.assignedUserId },
+      { what: set.assignedUserId ? "Follow-up reassigned" : "Follow-up updated", detail: set.assignedUserId ? `${by} assigned it to ${assignee!.name}` : `Updated by ${by}, due on ${indiaDate(due)}` },
+      set.assignedUserId ? { what: "Follow-up assigned to you", detail: `Assigned by ${by}, due on ${indiaDate(due)}` } : { what: "Follow-up updated", detail: `Updated by ${by}, due on ${indiaDate(due)}` },
+    ),
+  );
   res.json(
     toFollowUp(
       {
@@ -221,6 +265,8 @@ followUpsRouter.delete("/follow-ups/:id", requirePermission("follow_ups"), async
     INSERT INTO lead_activities (id, lead_id, actor_id, type, message, created_at)
     SELECT ${randomUUID()}::uuid, lead_id, ${actor}::uuid, 'follow_up_deleted', ${`Follow-up deleted: ${current.note}`}, ${now} FROM d`;
   if (!deleted) throw notFound("Follow-up");
+  const say = { what: "Follow-up deleted", detail: `Deleted by ${me(req).name}` };
+  void notify(followUpNotice(req, `fu_deleted:${id}`, current, say, say, true));
   res.status(204).end();
 });
 

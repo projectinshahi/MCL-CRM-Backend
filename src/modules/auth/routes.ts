@@ -2,7 +2,7 @@ import { hash, verify } from "@node-rs/argon2";
 import { randomUUID } from "node:crypto";
 import { Router, type CookieOptions, type Request } from "express";
 import { z } from "zod";
-import { env } from "../../config/env.ts";
+import { emailConfigured, env } from "../../config/env.ts";
 import { audit } from "../../lib/audit.ts";
 import { hashOtp, newOtp, newToken, safeEqual, sha256 } from "../../lib/crypto.ts";
 import { AppError } from "../../lib/errors.ts";
@@ -23,6 +23,8 @@ export const OTP_TTL_MS = 10 * 60 * 1000;
 export const OTP_MAX_ATTEMPTS = 5;
 export const OTP_RESEND_COOLDOWN_MS = 60 * 1000;
 export const OTP_MAX_PER_HOUR = 5;
+// And per day: 5 an hour with 5 guesses each, around the clock, would be 600 guesses a day at one account's code.
+export const OTP_MAX_PER_DAY = 10;
 const RESET_TOKEN_TTL_MS = 15 * 60 * 1000;
 
 // Verifying against a throwaway hash for unknown emails keeps login timing the same either way.
@@ -109,12 +111,13 @@ authRouter.get("/auth/me", requireAuth, (req, res) => {
 
 async function issueOtp(userId: string, to: string, req: Request) {
   const recent = await prisma.passwordReset.findMany({
-    where: { userId, createdAt: { gte: new Date(Date.now() - 60 * 60 * 1000) } },
+    where: { userId, createdAt: { gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } },
     select: { createdAt: true },
     orderBy: { createdAt: "desc" },
   });
   const coolingDown = recent[0] && Date.now() - recent[0].createdAt.getTime() < OTP_RESEND_COOLDOWN_MS;
-  if (coolingDown || recent.length >= OTP_MAX_PER_HOUR) return; // silently: the response is the same generic 202
+  const lastHour = recent.filter((r) => Date.now() - r.createdAt.getTime() < 60 * 60 * 1000).length;
+  if (coolingDown || lastHour >= OTP_MAX_PER_HOUR || recent.length >= OTP_MAX_PER_DAY) return; // silently: the response is the same generic 202
 
   const id = randomUUID();
   const otp = newOtp();
@@ -130,6 +133,10 @@ async function issueOtp(userId: string, to: string, req: Request) {
 
 authRouter.post("/auth/forgot-password", passwordResetLimiter, async (req, res) => {
   const body = z.object({ email }).parse(req.body);
+  // No email service: say so (the same for every address, so it reveals no accounts), instead of "we sent a code"
+  // that never arrives.
+  if (!emailConfigured)
+    throw new AppError(503, "EMAIL_UNAVAILABLE", "Password reset by email isn't set up yet. Ask an administrator to set a new password for you.");
   const user = await prisma.user.findUnique({ where: { email: body.email }, select: { id: true, status: true } });
   // Not awaited: a real account's code (several writes) must not make its answer slower than an unknown email's,
   // which would tell anyone which addresses have accounts.
@@ -141,11 +148,10 @@ const invalidOtp = () => new AppError(400, "INVALID_OTP", "The code is invalid o
 
 authRouter.post("/auth/verify-otp", passwordResetLimiter, async (req, res) => {
   const body = z.object({ email, otp: z.string().regex(/^\d{6}$/, "Enter the 6-digit code") }).parse(req.body);
-  const user = await prisma.user.findUnique({ where: { email: body.email }, select: { id: true, status: true } });
-  if (user?.status !== "active") throw invalidOtp();
-
+  // One query whether or not the account exists: looking the user up first answered unknown emails a round trip
+  // sooner, which told anyone timing the replies which addresses have accounts.
   const reset = await prisma.passwordReset.findFirst({
-    where: { userId: user.id, usedAt: null, verifiedAt: null, otpExpiresAt: { gt: new Date() }, attempts: { lt: OTP_MAX_ATTEMPTS } },
+    where: { user: { email: body.email, status: "active" }, usedAt: null, verifiedAt: null, otpExpiresAt: { gt: new Date() }, attempts: { lt: OTP_MAX_ATTEMPTS } },
     orderBy: { createdAt: "desc" },
   });
   if (!reset) throw invalidOtp();

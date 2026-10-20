@@ -17,7 +17,8 @@ export default function setup() {
     const u = new URL(url);
     return `${u.hostname.replace("-pooler.", ".").toLowerCase()}:${u.port || 5432}${u.pathname}`;
   };
-  const appTargets = [appEnv.DATABASE_URL, appEnv.DIRECT_URL, process.env.DATABASE_URL, process.env.DIRECT_URL].map(target);
+  const names = ["DATABASE_URL", "DIRECT_URL", "DATABASE_UNPOOLED_URL"];
+  const appTargets = names.flatMap((n) => [appEnv[n], process.env[n]]).map(target);
   if (appTargets.includes(target(testDb)))
     throw new Error("TEST_DATABASE_URL points at the app database — refusing to wipe it.");
 

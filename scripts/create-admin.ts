@@ -11,7 +11,7 @@ import { PrismaClient } from "../src/generated/prisma/client.ts";
 const name = process.env.ADMIN_NAME?.trim();
 const email = process.env.ADMIN_EMAIL?.trim().toLowerCase();
 const password = process.env.ADMIN_PASSWORD ?? "";
-const url = process.env.DIRECT_URL ?? process.env.DATABASE_URL;
+const url = process.env.DIRECT_URL ?? process.env.DATABASE_UNPOOLED_URL ?? process.env.DATABASE_URL; // as prisma.config.ts
 
 function fail(message: string): never {
   console.error(message);

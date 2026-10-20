@@ -32,7 +32,9 @@ export function readSessionCookie(req: Request): string | undefined {
 // so a role change or deactivation applies on the user's very next request.
 export const loadSession: RequestHandler = async (req, _res, next) => {
   const token = readSessionCookie(req);
-  if (token) {
+  // Only something shaped like newToken() (32 random bytes, base64url) is looked up: this runs before the rate
+  // limiters, so random cookies must not each cost a database query.
+  if (token && /^[A-Za-z0-9_-]{43}$/.test(token)) {
     const session = await prisma.session.findUnique({
       where: { tokenHash: sha256(token) },
       include: { user: { include: { role: { include: { permissions: true } } } } },

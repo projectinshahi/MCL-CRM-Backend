@@ -9,6 +9,7 @@ const cloud = vi.hoisted(() => ({
   uploads: 0,
   fail: ((_publicId: string) => false) as (publicId: string) => boolean,
   during: async () => {},
+  dropDownload: false, // Cloudinary's connection fails partway through sending the file
 }));
 vi.mock("../../src/lib/storage.ts", async (importOriginal) => {
   const real = await importOriginal<typeof import("../../src/lib/storage.ts")>();
@@ -31,6 +32,17 @@ const realFetch = globalThis.fetch;
 vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
   if (!String(url).startsWith("https://cloud.test/")) return realFetch(url, init);
   const bytes = cloud.files.get(decodeURIComponent(String(url).slice("https://cloud.test/".length)));
+  if (bytes && cloud.dropDownload) {
+    let sent = false;
+    const body = new ReadableStream({
+      pull(c) {
+        if (sent) return c.error(new Error("connection reset"));
+        c.enqueue(new Uint8Array(bytes.subarray(0, 8)));
+        sent = true;
+      },
+    });
+    return new Response(body, { headers: { "content-length": String(bytes.length) } });
+  }
   return bytes ? new Response(new Uint8Array(bytes), { headers: { "content-length": String(bytes.length) } }) : new Response("missing", { status: 404 });
 });
 
@@ -47,6 +59,7 @@ describe.skipIf(!hasDb)("lead attachments", () => {
     cloud.uploads = 0;
     cloud.fail = () => false;
     cloud.during = async () => {};
+    cloud.dropDownload = false;
   });
 
   it("creates a lead with a PDF and an image in one request; metadata is linked to the lead", async () => {
@@ -170,6 +183,20 @@ describe.skipIf(!hasDb)("lead attachments", () => {
     expect((await outsider.get(url)).status).toBe(404);
     expect((await owner.agent.get(`${API}/leads/${created.body.id}/attachments/${crypto.randomUUID()}`)).status).toBe(404);
     expect((await owner.agent.get(`${API}/leads/${created.body.id}/attachments/not-a-uuid`)).status).toBe(404);
+  });
+
+  it("a download cut off by Cloudinary ends that download only: the API keeps running", async () => {
+    const owner = await signedIn(["leads"]);
+    const created = await owner.agent.post(`${API}/leads`).field("lead", JSON.stringify({ title: "Docs", contact: { name: "Test Contact" } })).attach("files", PDF, "big.pdf");
+    const url = `${API}/leads/${created.body.id}/attachments/${created.body.attachments[0].id}`;
+    cloud.dropDownload = true;
+    // pipe() left the source's error unhandled: an uncaught exception that stopped the whole process (vitest
+    // reports it as an unhandled error). The client sees a broken-off transfer instead.
+    const cut = await owner.agent.get(url).then((r) => r.status, (e: Error) => e.message);
+    expect(cut).not.toBe(200);
+    cloud.dropDownload = false;
+    expect((await owner.agent.get(url)).status).toBe(200);
+    expect((await owner.agent.get(`${API}/auth/me`)).status).toBe(200);
   });
 
   it("needs the leads permission and a signed-in user", async () => {
