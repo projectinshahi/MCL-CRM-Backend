@@ -5,7 +5,9 @@ import { storageConfigured } from "../../config/env.ts";
 import { Prisma } from "../../generated/prisma/client.ts";
 import { AppError, invalid, isUniqueViolation, notFound } from "../../lib/errors.ts";
 import { checkFile, type FileKind } from "../../lib/files.ts";
-import { toMoney } from "../../lib/format.ts";
+import { todayIST, toMoney } from "../../lib/format.ts";
+import { inBatches, sendCsv } from "../../lib/csv.ts";
+import { audit } from "../../lib/audit.ts";
 import { blankToNull, email, idParam, listOf, money, optText, pageQuery, paged, phone, searchQ, text, weightKg } from "../../lib/http.ts";
 import { notify, type Notice } from "../../lib/notify.ts";
 import { prisma } from "../../lib/prisma.ts";
@@ -267,6 +269,22 @@ leadsRouter.get("/leads", requirePermission("leads"), async (req, res) => {
     prisma.lead.count({ where }),
   ]);
   res.json(listOf(rows.map(toLead), q, total));
+});
+
+// The Report button: every lead the list would show for this search, filter and sort (all pages), as CSV.
+leadsRouter.get("/leads/export", requirePermission("leads"), async (req, res) => {
+  const q = listFilters.extend({ sort: z.enum(Object.keys(SORTS) as [keyof typeof SORTS]).default("newest") }).parse(req.query);
+  const where = filterWhere(req, q);
+  const header = ["Title", "Stage", "Priority", "Expected value (INR)", "Payment", "Source", "Owner", "Contact name", "Contact phone", "Contact email", "Company", "Customer type", "District", "Customer ID", "Created"];
+  const rows = await sendCsv(
+    res,
+    "leads",
+    header,
+    inBatches((page) => prisma.lead.findMany({ where, include: leadInclude, orderBy: [SORTS[q.sort], { id: "asc" }], ...page })),
+    (l) => [l.title, l.status.name, l.priority, l.expectedValue?.toFixed(2), l.paymentStatus, l.source?.name, l.owner?.name, l.contactName, l.contactPhone, l.contactEmail, l.companyName, l.customerType, l.district, l.customer?.code, todayIST(l.createdAt)],
+  );
+  // Who took a copy of which records (filter names only, never the search text).
+  await audit(prisma, { actorId: me(req).id, action: "leads_exported", entityType: "lead", after: { rows, filters: Object.keys(q).filter((k) => q[k as keyof typeof q] && k !== "sort") }, ip: req.ip });
 });
 
 leadsRouter.get("/leads/pipeline", requirePermission("leads"), async (req, res) => {

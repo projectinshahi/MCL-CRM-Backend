@@ -6,6 +6,8 @@ import { AppError, invalid, notFound } from "../../lib/errors.ts";
 import { dateOnly, followUpStatus, indiaDate, leadLabel, parseDateOnly, todayIST } from "../../lib/format.ts";
 import { blankToNull, dateOnlyStr, idParam, listOf, pageQuery, paged, searchQ, text } from "../../lib/http.ts";
 import { notify, type Say } from "../../lib/notify.ts";
+import { inBatches, sendCsv } from "../../lib/csv.ts";
+import { audit } from "../../lib/audit.ts";
 import { prisma } from "../../lib/prisma.ts";
 import { updateWithHistory } from "../../lib/write.ts";
 import { me, requirePermission, seesAll } from "../../middleware/auth.ts";
@@ -72,14 +74,17 @@ const updateBody = createBody.omit({ id: true, leadId: true }).partial().strict(
 
 export const followUpsRouter = Router();
 
-followUpsRouter.get("/follow-ups", requirePermission("follow_ups"), async (req, res) => {
-  const q = pageQuery.extend({ q: searchQ, status: z.enum(["pending", "overdue", "completed"]).optional() }).parse(req.query);
-  const today = todayIST();
-  const scope = followUpScope(req);
+const listFilters = z.object({ q: searchQ, status: z.enum(["pending", "overdue", "completed"]).optional() });
+// Open ones first, by due date (overdue are the earliest); then completed, most recently completed first. By due
+// date alone, months of completed follow-ups filled the first pages and today's pending ones fell off them.
+const LIST_ORDER: Prisma.FollowUpOrderByWithRelationInput[] = [{ status: "asc" }, { completedAt: { sort: "desc", nulls: "first" } }, { dueDate: "asc" }, { createdAt: "asc" }, { id: "asc" }];
+
+/** The list's search and status filter within the caller's scope: shared by the list and its export. */
+function listWhere(req: Request, q: z.infer<typeof listFilters>, today: string): Prisma.FollowUpWhereInput {
   const contains = { contains: q.q, mode: "insensitive" } as const;
-  const where: Prisma.FollowUpWhereInput = {
+  return {
     AND: [
-      scope,
+      followUpScope(req),
       statusWhere(q.status, today),
       q.q
         ? {
@@ -94,20 +99,36 @@ followUpsRouter.get("/follow-ups", requirePermission("follow_ups"), async (req, 
         : {},
     ],
   };
+}
+
+followUpsRouter.get("/follow-ups", requirePermission("follow_ups"), async (req, res) => {
+  const q = pageQuery.extend(listFilters.shape).parse(req.query);
+  const today = todayIST();
+  const scope = followUpScope(req);
+  const where = listWhere(req, q, today);
   const [rows, total, pendingCount, overdueCount] = await Promise.all([
-    // Open ones first, by due date (overdue are the earliest); then completed, most recently completed first. By due
-    // date alone, months of completed follow-ups filled the first pages and today's pending ones fell off them.
-    prisma.followUp.findMany({
-      where,
-      include,
-      orderBy: [{ status: "asc" }, { completedAt: { sort: "desc", nulls: "first" } }, { dueDate: "asc" }, { createdAt: "asc" }, { id: "asc" }],
-      ...paged(q),
-    }),
+    prisma.followUp.findMany({ where, include, orderBy: LIST_ORDER, ...paged(q) }),
     prisma.followUp.count({ where }),
     prisma.followUp.count({ where: { AND: [scope, statusWhere("pending", today)] } }),
     prisma.followUp.count({ where: { AND: [scope, statusWhere("overdue", today)] } }),
   ]);
   res.json({ ...listOf(rows.map((r) => toFollowUp(r, today)), q, total), pendingCount, overdueCount });
+});
+
+// The Report button: every follow-up the list would show for this search and status (all pages), as CSV.
+followUpsRouter.get("/follow-ups/export", requirePermission("follow_ups"), async (req, res) => {
+  const q = listFilters.parse(req.query);
+  const today = todayIST();
+  const where = listWhere(req, q, today);
+  const header = ["Due date", "Status", "Type", "Note", "Lead", "Assigned to", "Next follow-up", "Completed", "Created"];
+  const rows = await sendCsv(
+    res,
+    "follow-ups",
+    header,
+    inBatches((page) => prisma.followUp.findMany({ where, include, orderBy: LIST_ORDER, ...page })),
+    (f) => [dateOnly(f.dueDate), followUpStatus(f.status, f.dueDate, today), TYPE_LABEL[f.type], f.note, leadLabel(f.lead), f.assignee?.name, f.nextFollowUpDate && dateOnly(f.nextFollowUpDate), f.completedAt && todayIST(f.completedAt), todayIST(f.createdAt)],
+  );
+  await audit(prisma, { actorId: me(req).id, action: "follow_ups_exported", entityType: "follow_up", after: { rows, filters: Object.keys(q).filter((k) => q[k as keyof typeof q]) }, ip: req.ip });
 });
 
 followUpsRouter.post("/follow-ups", requirePermission("follow_ups"), async (req, res) => {

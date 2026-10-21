@@ -5,7 +5,9 @@ import { storageConfigured } from "../../config/env.ts";
 import type { Prisma } from "../../generated/prisma/client.ts";
 import { audit } from "../../lib/audit.ts";
 import { AppError, invalid, isUniqueViolation, notFound } from "../../lib/errors.ts";
+import { inBatches, sendCsv } from "../../lib/csv.ts";
 import { checkFile, type FileKind } from "../../lib/files.ts";
+import { todayIST } from "../../lib/format.ts";
 import { blankToNull, dateOnlyStr, email, idParam, listOf, optText, pageQuery, paged, phone, searchQ, text } from "../../lib/http.ts";
 import { logger } from "../../lib/logger.ts";
 import { notify, type Notice } from "../../lib/notify.ts";
@@ -60,20 +62,20 @@ const toCustomer = (c: CustomerRow) => ({
 
 export const customersRouter = Router();
 
-customersRouter.get("/customers", requirePermission("customers"), async (req, res) => {
-  const q = pageQuery
-    .extend({
-      q: searchQ,
-      status: z.enum(["active", "inactive"]).optional(),
-      type: z.enum(CUSTOMER_TYPES).optional(),
-      sourceId: z.uuid().optional(),
-      assignedUserId: z.uuid().optional(), // narrows within the caller's scope; never widens it
-      createdFrom: dateOnlyStr.optional(), // YYYY-MM-DD, India time
-    })
-    .parse(req.query);
+const listFilters = z.object({
+  q: searchQ,
+  status: z.enum(["active", "inactive"]).optional(),
+  type: z.enum(CUSTOMER_TYPES).optional(),
+  sourceId: z.uuid().optional(),
+  assignedUserId: z.uuid().optional(), // narrows within the caller's scope; never widens it
+  createdFrom: dateOnlyStr.optional(), // YYYY-MM-DD, India time
+});
+
+/** The list's search and filters within the caller's scope: shared by the list and its export. */
+function listWhere(req: Request, q: z.infer<typeof listFilters>): Prisma.CustomerWhereInput {
   const contains = { contains: q.q, mode: "insensitive" } as const;
   const scope = customerScope(req);
-  const where: Prisma.CustomerWhereInput = {
+  return {
     ...scope,
     status: q.status,
     type: q.type,
@@ -98,6 +100,12 @@ customersRouter.get("/customers", requirePermission("customers"), async (req, re
       ],
     }),
   };
+}
+
+customersRouter.get("/customers", requirePermission("customers"), async (req, res) => {
+  const q = pageQuery.extend(listFilters.shape).parse(req.query);
+  const scope = customerScope(req);
+  const where = listWhere(req, q);
   // activeCount: every active customer the caller may see — the page's headline figure, independent of the search
   // and filters (the list's `total` is the filtered count).
   const [rows, total, activeCount] = await Promise.all([
@@ -110,6 +118,21 @@ customersRouter.get("/customers", requirePermission("customers"), async (req, re
 
 // The customer, plus the leads converted into it that the caller may see (deal, shipment and files stay on the
 // lead and keep the lead's own access rules). `hiddenLeads` counts linked leads the caller can't open.
+// The Report button: every customer the list would show for this search and these filters (all pages), as CSV.
+customersRouter.get("/customers/export", requirePermission("customers"), async (req, res) => {
+  const q = listFilters.parse(req.query);
+  const where = listWhere(req, q);
+  const header = ["Customer ID", "Name", "Company", "Phone", "Email", "Address", "District", "Company location", "Company email", "Type", "Source", "Assigned to", "Status", "Created", "Note"];
+  const rows = await sendCsv(
+    res,
+    "customers",
+    header,
+    inBatches((page) => prisma.customer.findMany({ where, include: customerInclude, orderBy: [{ createdAt: "desc" }, { id: "asc" }], ...page })),
+    (c) => [c.code, c.name, c.company, c.phone, c.email, c.address, c.district, c.companyLocation, c.companyEmail, c.type, c.source?.name, c.assignee?.name, c.status, todayIST(c.createdAt), c.note],
+  );
+  await audit(prisma, { actorId: me(req).id, action: "customers_exported", entityType: "customer", after: { rows, filters: Object.keys(q).filter((k) => q[k as keyof typeof q]) }, ip: req.ip });
+});
+
 customersRouter.get("/customers/:id", requirePermission("customers"), async (req, res) => {
   const id = idParam(req);
   const canSeeLeads = req.auth!.permissions.has("leads");

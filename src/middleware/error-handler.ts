@@ -33,5 +33,7 @@ export const notFoundRoute: RequestHandler = (_req, _res, next) => next(new AppE
 export const errorHandler: ErrorRequestHandler = (err, req, res, _next) => {
   const e = toAppError(err);
   if (e.status >= 500) req.log?.error({ err }, "unhandled error");
+  // Part of a file (an export, a download) is already on its way: no error body can follow, only a cut-off.
+  if (res.headersSent) return void res.destroy();
   res.status(e.status).json({ error: { code: e.code, message: e.message, ...(e.fields && { fields: e.fields }) } });
 };
